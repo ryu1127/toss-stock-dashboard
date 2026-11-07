@@ -18,11 +18,15 @@ import {
 import {
   buildDailySeries,
   buildMonthlySeries,
+  buildUnrealizedTaxSim,
+  buildYearlyTaxSummary,
   filterCashFlows,
   filterDividends,
   filterOrders,
   getAvailableHoldingDates,
   getHoldingsAtDate,
+  getPeriodPerformance,
+  getRealizedTrades,
 } from "./compute";
 import {
   fmtCompactKrw,
@@ -37,7 +41,13 @@ import {
 import { type AccountKey, getSpreadsheetUrl } from "./sheets";
 import { useDashboardStore } from "./store";
 
-type MainTab = "portfolio" | "trend" | "orders" | "dividends" | "cashflow";
+type MainTab =
+  | "portfolio"
+  | "trend"
+  | "tax"
+  | "orders"
+  | "dividends"
+  | "cashflow";
 
 const PIE_COLORS = [
   "#3b82f6",
@@ -104,6 +114,13 @@ export default function App() {
   >("ALL");
   const [trendYear, setTrendYear] = useState<string>("ALL");
 
+  // Tax & Realized P&L Tab states
+  const [taxYear, setTaxYear] = useState<string>("");
+  const [taxMarketFilter, setTaxMarketFilter] = useState<
+    "ALL" | "USD" | "KRW"
+  >("ALL");
+  const [taxSearch, setTaxSearch] = useState("");
+
   // Orders Tab states
   const [orderYear, setOrderYear] = useState<string>("ALL");
   const [orderSide, setOrderSide] = useState<"ALL" | "BUY" | "SELL">("ALL");
@@ -131,7 +148,6 @@ export default function App() {
   const [cfAmount, setCfAmount] = useState("");
   const [cfMemo, setCfMemo] = useState("");
 
-  // Sync default form account with top switcher
   useEffect(() => {
     if (account === "혜신" || account === "동헌") {
       setDivAcc(account);
@@ -152,6 +168,10 @@ export default function App() {
     dailySeries.length > 0 ? dailySeries[dailySeries.length - 1] : null;
 
   const orders = useMemo(() => filterOrders(data, account), [data, account]);
+  const realizedTrades = useMemo(
+    () => getRealizedTrades(data, account),
+    [data, account]
+  );
   const dividends = useMemo(
     () => filterDividends(data, account),
     [data, account]
@@ -160,6 +180,22 @@ export default function App() {
     () => filterCashFlows(data, account),
     [data, account]
   );
+
+  const periodPerformance = useMemo(
+    () => getPeriodPerformance(data, account, dailySeries, cashFlows),
+    [data, account, dailySeries, cashFlows]
+  );
+
+  const yearlyTaxSummaries = useMemo(
+    () => buildYearlyTaxSummary(realizedTrades, account),
+    [realizedTrades, account]
+  );
+
+  useEffect(() => {
+    if (yearlyTaxSummaries.length > 0 && !taxYear) {
+      setTaxYear(String(yearlyTaxSummaries[0].year));
+    }
+  }, [yearlyTaxSummaries, taxYear]);
 
   const totalDividendsKrw = useMemo(
     () => dividends.reduce((s, d) => s + d.netAmountKrw, 0),
@@ -175,11 +211,6 @@ export default function App() {
     [cashFlows]
   );
 
-  const buyOrderCount = useMemo(
-    () => orders.filter((o) => o.side === "BUY").length,
-    [orders]
-  );
-
   // Portfolio Holdings for selected date
   const effectiveHoldingDate = selectedHoldingDate || holdingDates[0] || "";
   const holdingsAtDate = useMemo(
@@ -187,6 +218,30 @@ export default function App() {
       getHoldingsAtDate(data, account, effectiveHoldingDate, mergeHoldings),
     [data, account, effectiveHoldingDate, mergeHoldings]
   );
+
+  // Latest holdings (for Unrealized Tax Simulation)
+  const latestHoldings = useMemo(
+    () =>
+      getHoldingsAtDate(data, account, holdingDates[0] || "", false),
+    [data, account, holdingDates]
+  );
+
+  const unrealizedSim = useMemo(
+    () => buildUnrealizedTaxSim(latestHoldings, realizedTrades, account),
+    [latestHoldings, realizedTrades, account]
+  );
+
+  const holdingsFxSummary = useMemo(() => {
+    const totalEval = holdingsAtDate.reduce((s, h) => s + h.evalKrw, 0);
+    const totalCost = holdingsAtDate.reduce((s, h) => s + h.purchaseKrw, 0);
+    const totalPnl = holdingsAtDate.reduce((s, h) => s + h.profitKrw, 0);
+    const totalFxPnl = holdingsAtDate.reduce((s, h) => s + h.fxPnlKrw, 0);
+    const totalStockPnl = holdingsAtDate.reduce(
+      (s, h) => s + h.stockPnlKrw,
+      0
+    );
+    return { totalEval, totalCost, totalPnl, totalFxPnl, totalStockPnl };
+  }, [holdingsAtDate]);
 
   const filteredHoldings = useMemo(() => {
     return holdingsAtDate.filter((h) => {
@@ -267,6 +322,84 @@ export default function App() {
     return list;
   }, [dailySeries, monthlySeries, trendGranularity, trendRange, trendYear]);
 
+  // Selected Tax Year Summary & Filtered Realized Trades
+  const effectiveTaxYear =
+    taxYear ||
+    (yearlyTaxSummaries[0] ? String(yearlyTaxSummaries[0].year) : "ALL");
+
+  const activeTaxSummary = useMemo(() => {
+    if (effectiveTaxYear === "ALL") {
+      const allSummary = buildYearlyTaxSummary(
+        realizedTrades.map((r) => ({ ...r, year: 9999 })),
+        account
+      )[0];
+      return (
+        allSummary ?? {
+          year: 9999,
+          usdSellCount: 0,
+          usdProceedsKrw: 0,
+          usdCostKrw: 0,
+          usdStockPnlKrw: 0,
+          usdFxPnlKrw: 0,
+          usdFeeKrw: 0,
+          usdNetPnlKrw: 0,
+          deductionKrw: 2_500_000,
+          taxableBaseKrw: 0,
+          estimatedTaxKrw: 0,
+          remainingDeductionKrw: 2_500_000,
+          krwSellCount: 0,
+          krwProceedsKrw: 0,
+          krwCostKrw: 0,
+          krwFeeKrw: 0,
+          krwNetPnlKrw: 0,
+        }
+      );
+    }
+    return (
+      yearlyTaxSummaries.find((s) => String(s.year) === effectiveTaxYear) ?? {
+        year: Number(effectiveTaxYear),
+        usdSellCount: 0,
+        usdProceedsKrw: 0,
+        usdCostKrw: 0,
+        usdStockPnlKrw: 0,
+        usdFxPnlKrw: 0,
+        usdFeeKrw: 0,
+        usdNetPnlKrw: 0,
+        deductionKrw: account === "ALL" ? 5_000_000 : 2_500_000,
+        taxableBaseKrw: 0,
+        estimatedTaxKrw: 0,
+        remainingDeductionKrw: account === "ALL" ? 5_000_000 : 2_500_000,
+        krwSellCount: 0,
+        krwProceedsKrw: 0,
+        krwCostKrw: 0,
+        krwFeeKrw: 0,
+        krwNetPnlKrw: 0,
+      }
+    );
+  }, [yearlyTaxSummaries, effectiveTaxYear, realizedTrades, account]);
+
+  const filteredRealizedTrades = useMemo(() => {
+    return realizedTrades.filter((t) => {
+      if (effectiveTaxYear !== "ALL" && String(t.year) !== effectiveTaxYear) {
+        return false;
+      }
+      if (
+        taxMarketFilter !== "ALL" &&
+        t.currency.toUpperCase() !== taxMarketFilter
+      ) {
+        return false;
+      }
+      if (taxSearch.trim()) {
+        const q = taxSearch.trim().toLowerCase();
+        return (
+          t.name.toLowerCase().includes(q) ||
+          t.symbol.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [realizedTrades, effectiveTaxYear, taxMarketFilter, taxSearch]);
+
   // Filtered Orders
   const orderYears = useMemo(() => {
     const yrs = new Set<string>();
@@ -331,10 +464,17 @@ export default function App() {
   }, [dividends]);
 
   const divByStock = useMemo(() => {
-    const map = new Map<string, { name: string; amount: number; count: number }>();
+    const map = new Map<
+      string,
+      { name: string; amount: number; count: number }
+    >();
     for (const d of dividends) {
       const key = d.symbol || d.name;
-      const cur = map.get(key) ?? { name: d.name || d.symbol, amount: 0, count: 0 };
+      const cur = map.get(key) ?? {
+        name: d.name || d.symbol,
+        amount: 0,
+        count: 0,
+      };
       cur.amount += d.netAmountKrw;
       cur.count += 1;
       map.set(key, cur);
@@ -361,10 +501,17 @@ export default function App() {
     }
     const netIn = totalIn - totalOut;
     const currentAssets = latestSnap?.totalAssets ?? 0;
-    const pureProfit = netIn > 0 ? currentAssets - netIn : latestSnap?.profitAmount ?? 0;
-    const pureRate = netIn > 0 ? (pureProfit / netIn) * 100 : latestSnap?.profitRate ?? 0;
+    const pureProfit =
+      netIn > 0 ? currentAssets - netIn : latestSnap?.profitAmount ?? 0;
+    const pureRate =
+      netIn > 0 ? (pureProfit / netIn) * 100 : latestSnap?.profitRate ?? 0;
     return { totalIn, totalOut, netIn, currentAssets, pureProfit, pureRate };
   }, [cashFlows, latestSnap]);
+
+  const totalRealizedNetPnl = useMemo(
+    () => realizedTrades.reduce((s, r) => s + r.netPnlKrw, 0),
+    [realizedTrades]
+  );
 
   const handleAddDividend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -412,7 +559,7 @@ export default function App() {
               <span className="acc-tag">TossStock Cloud</span>
             </div>
             <div className="brand-sub">
-              구글 시트 실시간 연동 · 👩 혜신 & 👨 동헌 통합 포트폴리오
+              구글 시트 14개 탭 실시간 연동 · 👩 혜신 & 👨 동헌 통합 포트폴리오 · 양도세 · 환차손익 분석
             </div>
           </div>
         </div>
@@ -530,7 +677,7 @@ export default function App() {
             개인 자산 보호를 위해 코드 저장소에는 어떠한 개인 데이터도 포함되지 않습니다.
             <br />
             우리집 가계부(<code>asset-dashboard-private</code>)와 동일한 구글 계정으로 연결하면
-            <strong> [혜신] · [동헌] 10개 시트 탭</strong>을 즉시 불러옵니다.
+            <strong> [혜신] · [동헌] 14개 시트 탭 (보유종목 · 실현손익 · 양도세 · 기간별성과 · 배당 · 입출금)</strong>을 즉시 불러옵니다.
           </p>
           <button
             className="btn btn-primary"
@@ -605,7 +752,7 @@ export default function App() {
             {fmtKrw(latestSnap?.totalAssets ?? 0)}
           </div>
           <div className="kpi-sub">
-            <span>직전 기록 대비</span>
+            <span>직전 대비</span>
             <strong className={pnlClass(latestSnap?.deltaAssets)}>
               {fmtKrw(latestSnap?.deltaAssets ?? 0, true)}
             </strong>
@@ -641,7 +788,7 @@ export default function App() {
           }
         >
           <div className="kpi-label">
-            <span>🎯 총 평가손익 (수익률)</span>
+            <span>🎯 평가손익 (주가 + 환차)</span>
             <span className={pnlBadgeClass(latestSnap?.profitRate)}>
               {fmtPct(latestSnap?.profitRate ?? 0)}
             </span>
@@ -652,9 +799,18 @@ export default function App() {
             {fmtKrw(latestSnap?.profitAmount ?? 0, true)}
           </div>
           <div className="kpi-sub">
-            <span>환차손익 포함</span>
-            <span className={pnlClass(latestSnap?.fxPnlKrw)}>
-              ({fmtKrw(latestSnap?.fxPnlKrw ?? 0, true)})
+            <span>
+              주가{" "}
+              <strong className={pnlClass(holdingsFxSummary.totalStockPnl)}>
+                {fmtCompactKrw(holdingsFxSummary.totalStockPnl, true)}
+              </strong>
+            </span>
+            <span>·</span>
+            <span>
+              환차{" "}
+              <strong className={pnlClass(holdingsFxSummary.totalFxPnl)}>
+                {fmtCompactKrw(holdingsFxSummary.totalFxPnl, true)}
+              </strong>
             </span>
           </div>
         </div>
@@ -686,33 +842,38 @@ export default function App() {
           style={{ "--kpi-accent": "#f59e0b" } as React.CSSProperties}
         >
           <div className="kpi-label">
-            <span>💵 누적 세후배당금</span>
+            <span>💸 누적 실현손익 & 배당</span>
             <span className="badge-up">배당 {dividends.length}건</span>
           </div>
-          <div className="kpi-value text-up">
-            {fmtKrw(totalDividendsKrw, true)}
+          <div className={"kpi-value " + pnlClass(totalRealizedNetPnl)}>
+            {fmtKrw(totalRealizedNetPnl, true)}
           </div>
           <div className="kpi-sub">
-            <span>매수 체결 {buyOrderCount}건</span>
-            {netDepositsKrw !== 0 && (
-              <>
-                <span>·</span>
-                <span>순입금 {fmtCompactKrw(netDepositsKrw)}</span>
-              </>
-            )}
+            <span>
+              누적 배당{" "}
+              <strong className="text-up">
+                {fmtCompactKrw(totalDividendsKrw, true)}
+              </strong>
+            </span>
+            <span>·</span>
+            <span>순입금 {fmtCompactKrw(netDepositsKrw)}</span>
           </div>
         </div>
       </section>
 
-      {/* Main 5 Navigation Tabs */}
+      {/* Main 6 Navigation Tabs */}
       <nav className="nav-tabs">
         {(
           [
-            { id: "portfolio", label: "📊 포트폴리오 & 보유종목" },
-            { id: "trend", label: "📅 일별·월별 자산 추이" },
-            { id: "orders", label: "🧾 매매 체결 이력" },
-            { id: "dividends", label: "💵 배당금 내역 (SGOV 등)" },
-            { id: "cashflow", label: "🏧 입출금 내역 & 실질 수익" },
+            { id: "portfolio", label: "📊 포트폴리오 & 환차손익" },
+            { id: "trend", label: "📅 자산 추이 & 기간별 성과" },
+            {
+              id: "tax",
+              label: `💸 실현손익 & 양도소득세 (${realizedTrades.length}건)`,
+            },
+            { id: "orders", label: `🧾 매매 체결 이력 (${orders.length}건)` },
+            { id: "dividends", label: `💵 배당금 내역 (${dividends.length}건)` },
+            { id: "cashflow", label: "🏧 입출금 & 실질 수익" },
           ] as { id: MainTab; label: string }[]
         ).map((t) => (
           <button
@@ -725,269 +886,1144 @@ export default function App() {
         ))}
       </nav>
 
-      {/* TAB 1: Portfolio & Holdings */}
+      {/* TAB 1: Portfolio & Holdings (with FX P&L Decomposition) */}
       {activeTab === "portfolio" && (
-        <>
-          <div className="panel">
-            <div className="panel-head">
-              <div>
-                <h2 className="panel-title">
-                  📊 보유종목 타임머신 & 비중 분석
-                </h2>
-                <div className="panel-sub">
-                  날짜를 선택하면 해당 일자의 종목별 스냅샷을 조회합니다. (상승 🔴 빨강 / 하락 🔵 파랑)
-                </div>
-              </div>
-
-              <div className="filter-bar">
-                <label style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                  📅 스냅샷 기준일:
-                </label>
-                <select
-                  className="select-input"
-                  value={effectiveHoldingDate}
-                  onChange={(e) => setSelectedHoldingDate(e.target.value)}
-                >
-                  {holdingDates.map((d, i) => (
-                    <option key={d} value={d}>
-                      {d} {i === 0 ? "(최신)" : ""}
-                    </option>
-                  ))}
-                </select>
-
-                {account === "ALL" && (
-                  <div className="seg-group">
-                    <button
-                      className={
-                        "seg-btn" + (mergeHoldings ? " active" : "")
-                      }
-                      onClick={() => setMergeHoldings(true)}
-                    >
-                      🔗 동일종목 합산
-                    </button>
-                    <button
-                      className={
-                        "seg-btn" + (!mergeHoldings ? " active" : "")
-                      }
-                      onClick={() => setMergeHoldings(false)}
-                    >
-                      👥 계좌별 분리
-                    </button>
-                  </div>
-                )}
+        <div className="panel">
+          <div className="panel-head">
+            <div>
+              <h2 className="panel-title">
+                📊 보유종목 타임머신 & 주가·환차손익 분해
+              </h2>
+              <div className="panel-sub">
+                해외주식의 원화 평가손익을 순수 주가 변동분(주가손익)과 환율 변동분(환차손익)으로 정밀 분해합니다.
               </div>
             </div>
 
-            <div className="grid-2">
-              {/* Allocation Donut Chart */}
+            <div className="filter-bar">
+              <label style={{ fontSize: 12.5, color: "var(--muted)" }}>
+                📅 스냅샷 기준일:
+              </label>
+              <select
+                className="select-input"
+                value={effectiveHoldingDate}
+                onChange={(e) => setSelectedHoldingDate(e.target.value)}
+              >
+                {holdingDates.map((d, i) => (
+                  <option key={d} value={d}>
+                    {d} {i === 0 ? "(최신)" : ""}
+                  </option>
+                ))}
+              </select>
+
+              {account === "ALL" && (
+                <div className="seg-group">
+                  <button
+                    className={"seg-btn" + (mergeHoldings ? " active" : "")}
+                    onClick={() => setMergeHoldings(true)}
+                  >
+                    🔗 동일종목 합산
+                  </button>
+                  <button
+                    className={"seg-btn" + (!mergeHoldings ? " active" : "")}
+                    onClick={() => setMergeHoldings(false)}
+                  >
+                    👥 계좌별 분리
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* FX Decomposition Summary Banner */}
+          <div className="mini-summary-row">
+            <div className="mini-box">
+              <div className="label">총 평가금액 (원금 합계)</div>
+              <div className="val">
+                {fmtKrw(holdingsFxSummary.totalEval)}{" "}
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                  (원금 {fmtCompactKrw(holdingsFxSummary.totalCost)})
+                </span>
+              </div>
+            </div>
+            <div className="mini-box">
+              <div className="label">📈 순수 주가 평가손익 (원)</div>
+              <div
+                className={"val " + pnlClass(holdingsFxSummary.totalStockPnl)}
+              >
+                {fmtKrw(holdingsFxSummary.totalStockPnl, true)}
+              </div>
+            </div>
+            <div className="mini-box">
+              <div className="label">💱 환율 변동 평가손익 (환차손익)</div>
+              <div className={"val " + pnlClass(holdingsFxSummary.totalFxPnl)}>
+                {fmtKrw(holdingsFxSummary.totalFxPnl, true)}
+              </div>
+            </div>
+            <div className="mini-box">
+              <div className="label">🎯 총 평가손익 (주가 + 환차)</div>
+              <div className={"val " + pnlClass(holdingsFxSummary.totalPnl)}>
+                {fmtKrw(holdingsFxSummary.totalPnl, true)}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid-2">
+            {/* Allocation Donut Chart */}
+            <div
+              style={{
+                background: "rgba(15, 23, 42, 0.55)",
+                border: "1px solid var(--border)",
+                borderRadius: 14,
+                padding: 16,
+              }}
+            >
               <div
                 style={{
-                  background: "rgba(15, 23, 42, 0.55)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 14,
-                  padding: 16,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: 10,
                 }}
               >
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    marginBottom: 10,
-                  }}
-                >
-                  <strong style={{ fontSize: 14 }}>🍩 자산 배분 비중</strong>
-                  <div className="seg-group">
-                    <button
-                      className={
-                        "seg-btn" + (allocMode === "stock" ? " active" : "")
-                      }
-                      onClick={() => setAllocMode("stock")}
-                    >
-                      종목별
-                    </button>
-                    <button
-                      className={
-                        "seg-btn" + (allocMode === "market" ? " active" : "")
-                      }
-                      onClick={() => setAllocMode("market")}
-                    >
-                      국내·해외·현금
-                    </button>
-                  </div>
-                </div>
-
-                <div style={{ height: 270 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={pieData}
-                        dataKey="value"
-                        nameKey="name"
-                        cx="50%"
-                        cy="50%"
-                        innerRadius={58}
-                        outerRadius={92}
-                        paddingAngle={2}
-                      >
-                        {pieData.map((_, idx) => (
-                          <Cell
-                            key={idx}
-                            fill={PIE_COLORS[idx % PIE_COLORS.length]}
-                          />
-                        ))}
-                      </Pie>
-                      <Tooltip
-                        formatter={(val: number) => fmtKrw(val)}
-                        contentStyle={{
-                          background: "#0f172a",
-                          border: "1px solid rgba(148,163,184,0.3)",
-                          borderRadius: 10,
-                          color: "#f1f5f9",
-                        }}
-                      />
-                      <Legend />
-                    </PieChart>
-                  </ResponsiveContainer>
+                <strong style={{ fontSize: 14 }}>🍩 자산 배분 비중</strong>
+                <div className="seg-group">
+                  <button
+                    className={
+                      "seg-btn" + (allocMode === "stock" ? " active" : "")
+                    }
+                    onClick={() => setAllocMode("stock")}
+                  >
+                    종목별
+                  </button>
+                  <button
+                    className={
+                      "seg-btn" + (allocMode === "market" ? " active" : "")
+                    }
+                    onClick={() => setAllocMode("market")}
+                  >
+                    국내·해외·현금
+                  </button>
                 </div>
               </div>
 
-              {/* Per-Stock Profit/Loss Bar Chart */}
+              <div style={{ height: 270 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={pieData}
+                      dataKey="value"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={58}
+                      outerRadius={92}
+                      paddingAngle={2}
+                    >
+                      {pieData.map((_, idx) => (
+                        <Cell
+                          key={idx}
+                          fill={PIE_COLORS[idx % PIE_COLORS.length]}
+                        />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      formatter={(val: number) => fmtKrw(val)}
+                      contentStyle={{
+                        background: "#0f172a",
+                        border: "1px solid rgba(148,163,184,0.3)",
+                        borderRadius: 10,
+                        color: "#f1f5f9",
+                      }}
+                    />
+                    <Legend />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Per-Stock Profit/Loss Bar Chart */}
+            <div
+              style={{
+                background: "rgba(15, 23, 42, 0.55)",
+                border: "1px solid var(--border)",
+                borderRadius: 14,
+                padding: 16,
+              }}
+            >
               <div
                 style={{
-                  background: "rgba(15, 23, 42, 0.55)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 14,
-                  padding: 16,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: 10,
                 }}
               >
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    marginBottom: 10,
-                  }}
-                >
-                  <strong style={{ fontSize: 14 }}>
-                    📊 종목별 평가손익 (🔴 수익 / 🔵 손실)
-                  </strong>
-                  <span style={{ fontSize: 12, color: "var(--muted)" }}>
-                    상위 10개 종목
-                  </span>
-                </div>
+                <strong style={{ fontSize: 14 }}>
+                  📊 종목별 총평가손익 (🔴 수익 / 🔵 손실)
+                </strong>
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                  상위 10개 종목
+                </span>
+              </div>
 
-                <div style={{ height: 270 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart
-                      data={[...holdingsAtDate]
+              <div style={{ height: 270 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={[...holdingsAtDate]
+                      .sort(
+                        (a, b) =>
+                          Math.abs(b.profitKrw) - Math.abs(a.profitKrw)
+                      )
+                      .slice(0, 10)
+                      .map((h) => ({
+                        name:
+                          h.name.length > 9
+                            ? h.name.slice(0, 9) + "…"
+                            : h.name,
+                        profitKrw: Math.round(h.profitKrw),
+                        stockPnlKrw: Math.round(h.stockPnlKrw),
+                        fxPnlKrw: Math.round(h.fxPnlKrw),
+                      }))}
+                    layout="vertical"
+                    margin={{ top: 4, right: 20, left: 24, bottom: 4 }}
+                  >
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(148,163,184,0.12)"
+                    />
+                    <XAxis
+                      type="number"
+                      tickFormatter={(v) => fmtCompactKrw(v)}
+                      stroke="#94a3b8"
+                      fontSize={11}
+                    />
+                    <YAxis
+                      type="category"
+                      dataKey="name"
+                      width={88}
+                      stroke="#e2e8f0"
+                      fontSize={11.5}
+                    />
+                    <ReferenceLine x={0} stroke="rgba(148,163,184,0.4)" />
+                    <Tooltip
+                      formatter={(val: number) => [
+                        fmtKrw(val, true),
+                        "총평가손익",
+                      ]}
+                      contentStyle={{
+                        background: "#0f172a",
+                        border: "1px solid rgba(148,163,184,0.3)",
+                        borderRadius: 10,
+                        color: "#f1f5f9",
+                      }}
+                    />
+                    <Bar dataKey="profitKrw" radius={[4, 4, 4, 4]}>
+                      {[...holdingsAtDate]
                         .sort(
                           (a, b) =>
                             Math.abs(b.profitKrw) - Math.abs(a.profitKrw)
                         )
                         .slice(0, 10)
-                        .map((h) => ({
-                          name:
-                            h.name.length > 9
-                              ? h.name.slice(0, 9) + "…"
-                              : h.name,
-                          profitKrw: Math.round(h.profitKrw),
-                          profitRate: h.profitRate,
-                        }))}
-                      layout="vertical"
-                      margin={{ top: 4, right: 20, left: 24, bottom: 4 }}
+                        .map((entry, idx) => (
+                          <Cell
+                            key={idx}
+                            fill={
+                              entry.profitKrw >= 0 ? "#ff6b6b" : "#60a5fa"
+                            }
+                          />
+                        ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
+          {/* Holdings Table Filter & Search */}
+          <div className="panel-head" style={{ marginTop: 8 }}>
+            <div className="filter-bar">
+              <div className="seg-group">
+                {(
+                  [
+                    { k: "ALL", l: "전체 시장" },
+                    { k: "USD", l: "🇺🇸 해외 (USD)" },
+                    { k: "KRW", l: "🇰🇷 국내 (KRW)" },
+                  ] as const
+                ).map((m) => (
+                  <button
+                    key={m.k}
+                    className={
+                      "seg-btn" +
+                      (holdingMarketFilter === m.k ? " active" : "")
+                    }
+                    onClick={() => setHoldingMarketFilter(m.k)}
+                  >
+                    {m.l}
+                  </button>
+                ))}
+              </div>
+
+              <input
+                className="text-input"
+                placeholder="🔍 종목명 또는 티커 검색..."
+                value={holdingSearch}
+                onChange={(e) => setHoldingSearch(e.target.value)}
+              />
+            </div>
+
+            <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
+              총 <strong>{filteredHoldings.length}</strong>개 종목 · 평가금액 합계{" "}
+              <strong>
+                {fmtKrw(filteredHoldings.reduce((s, h) => s + h.evalKrw, 0))}
+              </strong>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <table className="stock-table">
+              <thead>
+                <tr>
+                  <th>시장</th>
+                  <th>계좌</th>
+                  <th>종목명 (코드)</th>
+                  <th className="num">보유수량</th>
+                  <th className="num">평단가</th>
+                  <th className="num">현재가</th>
+                  <th className="num">매수환율</th>
+                  <th className="num">평가금액(원)</th>
+                  <th className="num">매수원금(원)</th>
+                  <th className="num">주가손익(원)</th>
+                  <th className="num">환차손익(원)</th>
+                  <th className="num">총평가손익(원)</th>
+                  <th className="num">수익률(원화)</th>
+                  <th className="num">비중(%)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredHoldings.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={14}
+                      style={{
+                        textAlign: "center",
+                        padding: 36,
+                        color: "var(--muted)",
+                      }}
                     >
-                      <CartesianGrid
-                        strokeDasharray="3 3"
-                        stroke="rgba(148,163,184,0.12)"
+                      표시할 보유종목 데이터가 없습니다.
+                    </td>
+                  </tr>
+                ) : (
+                  filteredHoldings.map((h) => (
+                    <tr key={h.key}>
+                      <td>
+                        <span
+                          className={
+                            "market-tag " +
+                            (h.currency.toUpperCase() === "USD" ? "usd" : "krw")
+                          }
+                        >
+                          {h.currency.toUpperCase() === "USD"
+                            ? "해외 USD"
+                            : "국내 KRW"}
+                        </span>
+                      </td>
+                      <td>
+                        <span className="acc-tag">{h.accountLabel}</span>
+                      </td>
+                      <td>
+                        <strong>{h.name}</strong>{" "}
+                        <span style={{ color: "var(--muted)", fontSize: 11.5 }}>
+                          ({h.symbol})
+                        </span>
+                      </td>
+                      <td className="num">{fmtNum(h.quantity, 4)}</td>
+                      <td className="num">
+                        {fmtPrice(h.avgPrice, h.currency)}
+                      </td>
+                      <td className="num">
+                        {fmtPrice(h.lastPrice, h.currency)}
+                      </td>
+                      <td className="num" style={{ color: "var(--muted)" }}>
+                        {h.currency.toUpperCase() === "USD" && h.avgBuyFx > 1
+                          ? `${fmtNum(h.avgBuyFx, 1)}원`
+                          : "—"}
+                      </td>
+                      <td className="num">
+                        <strong>{fmtKrw(h.evalKrw)}</strong>
+                      </td>
+                      <td className="num">{fmtKrw(h.purchaseKrw)}</td>
+                      <td className={"num " + pnlClass(h.stockPnlKrw)}>
+                        {fmtKrw(h.stockPnlKrw, true)}
+                      </td>
+                      <td className={"num " + pnlClass(h.fxPnlKrw)}>
+                        {h.currency.toUpperCase() === "USD"
+                          ? fmtKrw(h.fxPnlKrw, true)
+                          : "—"}
+                      </td>
+                      <td className={"num " + pnlClass(h.profitKrw)}>
+                        <strong>{fmtKrw(h.profitKrw, true)}</strong>
+                      </td>
+                      <td className="num">
+                        <span className={pnlBadgeClass(h.profitRate)}>
+                          {pnlArrow(h.profitRate)} {fmtPct(h.profitRate)}
+                        </span>
+                      </td>
+                      <td className="num">{h.weightPct.toFixed(1)}%</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 2: Daily / Monthly Asset Trend & Period Performance */}
+      {activeTab === "trend" && (
+        <>
+          {/* Period Performance Summary Panel */}
+          {periodPerformance.length > 0 && (
+            <div className="panel">
+              <div className="panel-head">
+                <div>
+                  <h2 className="panel-title">
+                    🏆 기간별 투자 성과 요약 (Modified Dietz 실질 성장률)
+                  </h2>
+                  <div className="panel-sub">
+                    최근 1주 · 1개월 · 3개월 · 6개월 · 올해(YTD) · 1년 · 전체 기록 기간 동안 입출금 왜곡을 제거한 순수 투자손익과 실질 성장률입니다.
+                  </div>
+                </div>
+              </div>
+
+              <div className="table-wrap">
+                <table className="stock-table">
+                  <thead>
+                    <tr>
+                      <th>구간</th>
+                      <th>산정 기간</th>
+                      <th className="num">기초자산(원)</th>
+                      <th className="num">기말자산(원)</th>
+                      <th className="num">기간 내 순입출금(원)</th>
+                      <th className="num">단순 자산증감(원)</th>
+                      <th className="num">단순 증감률(%)</th>
+                      <th className="num">순수 투자손익(입출금 제외)</th>
+                      <th className="num">실질 투자성장률(Dietz %)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {periodPerformance.map((p) => (
+                      <tr key={p.period}>
+                        <td>
+                          <strong>{p.period}</strong>
+                        </td>
+                        <td style={{ color: "var(--muted)", fontSize: 12 }}>
+                          {p.startDate} ~ {p.endDate}
+                        </td>
+                        <td className="num">{fmtKrw(p.startAssets)}</td>
+                        <td className="num">
+                          <strong>{fmtKrw(p.endAssets)}</strong>
+                        </td>
+                        <td className={"num " + pnlClass(p.netCashFlow)}>
+                          {p.netCashFlow !== 0
+                            ? fmtKrw(p.netCashFlow, true)
+                            : "0원"}
+                        </td>
+                        <td className={"num " + pnlClass(p.simpleChange)}>
+                          {fmtKrw(p.simpleChange, true)}
+                        </td>
+                        <td className={"num " + pnlClass(p.simpleRate)}>
+                          {fmtPct(p.simpleRate)}
+                        </td>
+                        <td className={"num " + pnlClass(p.pureProfit)}>
+                          <strong>{fmtKrw(p.pureProfit, true)}</strong>
+                        </td>
+                        <td className="num">
+                          <span className={pnlBadgeClass(p.dietzRate)}>
+                            {pnlArrow(p.dietzRate)} {fmtPct(p.dietzRate)}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          <div className="panel">
+            <div className="panel-head">
+              <div>
+                <h2 className="panel-title">📅 일별 · 월별 자산 추이</h2>
+                <div className="panel-sub">
+                  월말 기준 요약 또는 일별 전체 스냅샷으로 총자산·매수원금·평가손익 흐름을 비교합니다.
+                </div>
+              </div>
+
+              <div className="filter-bar">
+                <div className="seg-group">
+                  <button
+                    className={
+                      "seg-btn" +
+                      (trendGranularity === "monthly" ? " active" : "")
+                    }
+                    onClick={() => setTrendGranularity("monthly")}
+                  >
+                    📆 월말 요약 (추천)
+                  </button>
+                  <button
+                    className={
+                      "seg-btn" +
+                      (trendGranularity === "daily" ? " active" : "")
+                    }
+                    onClick={() => setTrendGranularity("daily")}
+                  >
+                    📅 일별 전체 보기
+                  </button>
+                </div>
+
+                <div className="seg-group">
+                  {(
+                    [
+                      { k: "1M", l: "1개월" },
+                      { k: "3M", l: "3개월" },
+                      { k: "6M", l: "6개월" },
+                      { k: "1Y", l: "1년" },
+                      { k: "ALL", l: "전체" },
+                    ] as const
+                  ).map((r) => (
+                    <button
+                      key={r.k}
+                      className={
+                        "seg-btn" + (trendRange === r.k ? " active" : "")
+                      }
+                      onClick={() => setTrendRange(r.k)}
+                    >
+                      {r.l}
+                    </button>
+                  ))}
+                </div>
+
+                <select
+                  className="select-input"
+                  value={trendYear}
+                  onChange={(e) => setTrendYear(e.target.value)}
+                >
+                  <option value="ALL">전체 연도</option>
+                  {availableYears.map((y) => (
+                    <option key={y} value={y}>
+                      {y}년
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Main Area Chart: Total Assets vs Cost */}
+            <div
+              style={{
+                height: 320,
+                background: "rgba(15, 23, 42, 0.55)",
+                border: "1px solid var(--border)",
+                borderRadius: 14,
+                padding: 16,
+                marginBottom: 18,
+              }}
+            >
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={filteredTrendSeries}
+                  margin={{ top: 10, right: 20, left: 10, bottom: 0 }}
+                >
+                  <defs>
+                    <linearGradient id="gradTotal" x1="0" y1="0" x2="0" y2="1">
+                      <stop
+                        offset="5%"
+                        stopColor="#3b82f6"
+                        stopOpacity={0.45}
                       />
-                      <XAxis
-                        type="number"
-                        tickFormatter={(v) => fmtCompactKrw(v)}
-                        stroke="#94a3b8"
-                        fontSize={11}
+                      <stop
+                        offset="95%"
+                        stopColor="#3b82f6"
+                        stopOpacity={0.02}
                       />
-                      <YAxis
-                        type="category"
-                        dataKey="name"
-                        width={88}
-                        stroke="#e2e8f0"
-                        fontSize={11.5}
+                    </linearGradient>
+                    <linearGradient id="gradStock" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3} />
+                      <stop
+                        offset="95%"
+                        stopColor="#8b5cf6"
+                        stopOpacity={0.02}
                       />
-                      <ReferenceLine x={0} stroke="rgba(148,163,184,0.4)" />
-                      <Tooltip
-                        formatter={(val: number) => [
-                          fmtKrw(val, true),
-                          "평가손익",
-                        ]}
-                        contentStyle={{
-                          background: "#0f172a",
-                          border: "1px solid rgba(148,163,184,0.3)",
-                          borderRadius: 10,
-                          color: "#f1f5f9",
-                        }}
-                      />
-                      <Bar dataKey="profitKrw" radius={[4, 4, 4, 4]}>
-                        {[...holdingsAtDate]
-                          .sort(
-                            (a, b) =>
-                              Math.abs(b.profitKrw) - Math.abs(a.profitKrw)
-                          )
-                          .slice(0, 10)
-                          .map((entry, idx) => (
-                            <Cell
-                              key={idx}
-                              fill={
-                                entry.profitKrw >= 0 ? "#ff6b6b" : "#60a5fa"
-                              }
-                            />
-                          ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="rgba(148,163,184,0.12)"
+                  />
+                  <XAxis dataKey="label" stroke="#94a3b8" fontSize={12} />
+                  <YAxis
+                    tickFormatter={(v) => fmtCompactKrw(v)}
+                    stroke="#94a3b8"
+                    fontSize={11.5}
+                    width={80}
+                  />
+                  <Tooltip
+                    formatter={(val: number, name: string) => [
+                      fmtKrw(val),
+                      name,
+                    ]}
+                    contentStyle={{
+                      background: "#0f172a",
+                      border: "1px solid rgba(148,163,184,0.3)",
+                      borderRadius: 10,
+                      color: "#f1f5f9",
+                    }}
+                  />
+                  <Legend />
+                  <Area
+                    type="monotone"
+                    dataKey="totalAssets"
+                    name="총자산(주식+예수금)"
+                    stroke="#3b82f6"
+                    strokeWidth={2.5}
+                    fill="url(#gradTotal)"
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="holdingsEval"
+                    name="주식평가액"
+                    stroke="#8b5cf6"
+                    strokeWidth={2}
+                    fill="url(#gradStock)"
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="holdingsCost"
+                    name="매수원금"
+                    stroke="#94a3b8"
+                    strokeDasharray="4 4"
+                    strokeWidth={1.8}
+                    fill="none"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Two Color Bar Charts: Profit Trend & Delta Trend */}
+            <div className="grid-2">
+              <div
+                style={{
+                  height: 250,
+                  background: "rgba(15, 23, 42, 0.55)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 14,
+                  padding: 16,
+                }}
+              >
+                <strong
+                  style={{ display: "block", fontSize: 13.5, marginBottom: 8 }}
+                >
+                  🎯 평가손익 추이 (🔴 수익 / 🔵 손실)
+                </strong>
+                <ResponsiveContainer width="100%" height="88%">
+                  <BarChart data={filteredTrendSeries}>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(148,163,184,0.12)"
+                    />
+                    <XAxis dataKey="label" stroke="#94a3b8" fontSize={11} />
+                    <YAxis
+                      tickFormatter={(v) => fmtCompactKrw(v)}
+                      stroke="#94a3b8"
+                      fontSize={11}
+                      width={72}
+                    />
+                    <ReferenceLine y={0} stroke="rgba(148,163,184,0.4)" />
+                    <Tooltip
+                      formatter={(val: number) => [
+                        fmtKrw(val, true),
+                        "평가손익",
+                      ]}
+                      contentStyle={{
+                        background: "#0f172a",
+                        border: "1px solid rgba(148,163,184,0.3)",
+                        borderRadius: 10,
+                      }}
+                    />
+                    <Bar dataKey="profitAmount">
+                      {filteredTrendSeries.map((pt, i) => (
+                        <Cell
+                          key={i}
+                          fill={pt.profitAmount >= 0 ? "#ff6b6b" : "#60a5fa"}
+                        />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div
+                style={{
+                  height: 250,
+                  background: "rgba(15, 23, 42, 0.55)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 14,
+                  padding: 16,
+                }}
+              >
+                <strong
+                  style={{ display: "block", fontSize: 13.5, marginBottom: 8 }}
+                >
+                  📊{" "}
+                  {trendGranularity === "monthly"
+                    ? "전월 대비 총자산 증감"
+                    : "전일 대비 총자산 증감"}{" "}
+                  (🔴 증가 / 🔵 감소)
+                </strong>
+                <ResponsiveContainer width="100%" height="88%">
+                  <BarChart data={filteredTrendSeries}>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(148,163,184,0.12)"
+                    />
+                    <XAxis dataKey="label" stroke="#94a3b8" fontSize={11} />
+                    <YAxis
+                      tickFormatter={(v) => fmtCompactKrw(v)}
+                      stroke="#94a3b8"
+                      fontSize={11}
+                      width={72}
+                    />
+                    <ReferenceLine y={0} stroke="rgba(148,163,184,0.4)" />
+                    <Tooltip
+                      formatter={(val: number) => [
+                        fmtKrw(val, true),
+                        "자산 증감",
+                      ]}
+                      contentStyle={{
+                        background: "#0f172a",
+                        border: "1px solid rgba(148,163,184,0.3)",
+                        borderRadius: 10,
+                      }}
+                    />
+                    <Bar dataKey="deltaAssets">
+                      {filteredTrendSeries.map((pt, i) => (
+                        <Cell
+                          key={i}
+                          fill={pt.deltaAssets >= 0 ? "#ff6b6b" : "#60a5fa"}
+                        />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Trend Table */}
+            <div className="table-wrap">
+              <table className="stock-table">
+                <thead>
+                  <tr>
+                    <th>기준일자</th>
+                    <th className="num">총자산(원)</th>
+                    <th className="num">
+                      {trendGranularity === "monthly"
+                        ? "전월 대비(원)"
+                        : "전일 대비(원)"}
+                    </th>
+                    <th className="num">주식평가액(원)</th>
+                    <th className="num">매수원금(원)</th>
+                    <th className="num">예수금(원)</th>
+                    <th className="num">평가손익(원)</th>
+                    <th className="num">수익률(%)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...filteredTrendSeries].reverse().map((pt) => (
+                    <tr key={pt.date}>
+                      <td>
+                        <strong>{pt.date}</strong>
+                      </td>
+                      <td className="num">
+                        <strong>{fmtKrw(pt.totalAssets)}</strong>
+                      </td>
+                      <td className={"num " + pnlClass(pt.deltaAssets)}>
+                        {pt.deltaAssets !== 0
+                          ? `${fmtKrw(pt.deltaAssets, true)} (${fmtPct(
+                              pt.deltaRate
+                            )})`
+                          : "—"}
+                      </td>
+                      <td className="num">{fmtKrw(pt.holdingsEval)}</td>
+                      <td className="num">{fmtKrw(pt.holdingsCost)}</td>
+                      <td className="num">{fmtKrw(pt.cash)}</td>
+                      <td className={"num " + pnlClass(pt.profitAmount)}>
+                        <strong>{fmtKrw(pt.profitAmount, true)}</strong>
+                      </td>
+                      <td className="num">
+                        <span className={pnlBadgeClass(pt.profitRate)}>
+                          {pnlArrow(pt.profitRate)} {fmtPct(pt.profitRate)}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* TAB 3: Realized P&L & Overseas Capital Gains Tax */}
+      {activeTab === "tax" && (
+        <>
+          <div className="panel">
+            <div className="panel-head">
+              <div>
+                <h2 className="panel-title">
+                  🏛️ 해외주식 양도소득세 계산기 & 연도별 실현손익 분석
+                </h2>
+                <div className="panel-sub">
+                  이동평균법 기준 매도 건별 취득원가·실현 주가손익·실현 환차손익을 분해하고, 해외주식 연 250만원 기본공제 후 22% 양도소득세를 자동 산출합니다.
+                </div>
+              </div>
+
+              <div className="filter-bar">
+                <label style={{ fontSize: 12.5, color: "var(--muted)" }}>
+                  📅 과세연도:
+                </label>
+                <select
+                  className="select-input"
+                  value={effectiveTaxYear}
+                  onChange={(e) => setTaxYear(e.target.value)}
+                >
+                  {yearlyTaxSummaries.map((s) => (
+                    <option key={s.year} value={String(s.year)}>
+                      {s.year}년 귀속 (해외 {s.usdSellCount}건 / 국내{" "}
+                      {s.krwSellCount}건)
+                    </option>
+                  ))}
+                  <option value="ALL">전체 연도 누적</option>
+                </select>
+              </div>
+            </div>
+
+            {/* 5 Tax Calculator Cards */}
+            <div className="kpi-grid" style={{ marginBottom: 18 }}>
+              <div
+                className="kpi-card"
+                style={{ "--kpi-accent": "#3b82f6" } as React.CSSProperties}
+              >
+                <div className="kpi-label">
+                  <span>🇺🇸 해외주식 순실현손익</span>
+                  <span className="badge-flat">
+                    매도 {activeTaxSummary.usdSellCount}건
+                  </span>
+                </div>
+                <div
+                  className={
+                    "kpi-value " + pnlClass(activeTaxSummary.usdNetPnlKrw)
+                  }
+                >
+                  {fmtKrw(activeTaxSummary.usdNetPnlKrw, true)}
+                </div>
+                <div className="kpi-sub">
+                  <span>
+                    매도총액 {fmtCompactKrw(activeTaxSummary.usdProceedsKrw)}
+                  </span>
+                </div>
+              </div>
+
+              <div
+                className="kpi-card"
+                style={{ "--kpi-accent": "#8b5cf6" } as React.CSSProperties}
+              >
+                <div className="kpi-label">
+                  <span>↳ 주가손익 vs 환차손익</span>
+                  <span className="badge-flat">원화 환산 분해</span>
+                </div>
+                <div
+                  className={
+                    "kpi-value " + pnlClass(activeTaxSummary.usdStockPnlKrw)
+                  }
+                  style={{ fontSize: 18 }}
+                >
+                  주가 {fmtKrw(activeTaxSummary.usdStockPnlKrw, true)}
+                </div>
+                <div className="kpi-sub">
+                  <span>환차손익</span>
+                  <strong className={pnlClass(activeTaxSummary.usdFxPnlKrw)}>
+                    {fmtKrw(activeTaxSummary.usdFxPnlKrw, true)}
+                  </strong>
+                  <span>
+                    · 제비용 -{fmtCompactKrw(activeTaxSummary.usdFeeKrw)}
+                  </span>
+                </div>
+              </div>
+
+              <div
+                className="kpi-card"
+                style={{ "--kpi-accent": "#10b981" } as React.CSSProperties}
+              >
+                <div className="kpi-label">
+                  <span>🛡️ 기본공제 후 과세표준</span>
+                  <span className="badge-flat">
+                    공제 {fmtCompactKrw(activeTaxSummary.deductionKrw)}
+                  </span>
+                </div>
+                <div className="kpi-value">
+                  {fmtKrw(activeTaxSummary.taxableBaseKrw)}
+                </div>
+                <div className="kpi-sub">
+                  <span>남은 비과세 한도</span>
+                  <strong className="text-up">
+                    {fmtKrw(activeTaxSummary.remainingDeductionKrw)}
+                  </strong>
+                </div>
+              </div>
+
+              <div
+                className="kpi-card"
+                style={{ "--kpi-accent": "#f59e0b" } as React.CSSProperties}
+              >
+                <div className="kpi-label">
+                  <span>🏛️ 예상 양도소득세 (22%)</span>
+                  <span
+                    className={
+                      activeTaxSummary.estimatedTaxKrw > 0
+                        ? "badge-up"
+                        : "badge-flat"
+                    }
+                  >
+                    {activeTaxSummary.estimatedTaxKrw > 0
+                      ? "신고·납부 대상"
+                      : "세액 없음 (0원)"}
+                  </span>
+                </div>
+                <div className="kpi-value">
+                  {fmtKrw(activeTaxSummary.estimatedTaxKrw)}
+                </div>
+                <div className="kpi-sub">
+                  <span>양도세 20% + 지방소득세 2%</span>
+                </div>
+              </div>
+
+              <div
+                className="kpi-card"
+                style={{ "--kpi-accent": "#ec4899" } as React.CSSProperties}
+              >
+                <div className="kpi-label">
+                  <span>🇰🇷 국내주식 순실현손익</span>
+                  <span className="badge-flat">
+                    매도 {activeTaxSummary.krwSellCount}건 (비과세)
+                  </span>
+                </div>
+                <div
+                  className={
+                    "kpi-value " + pnlClass(activeTaxSummary.krwNetPnlKrw)
+                  }
+                >
+                  {fmtKrw(activeTaxSummary.krwNetPnlKrw, true)}
+                </div>
+                <div className="kpi-sub">
+                  <span>
+                    수수료·거래세 -{fmtKrw(activeTaxSummary.krwFeeKrw)}
+                  </span>
                 </div>
               </div>
             </div>
 
-            {/* Holdings Table Filter & Search */}
-            <div className="panel-head" style={{ marginTop: 8 }}>
+            {/* Unrealized Tax & Tax-Loss Harvesting Simulation */}
+            <div
+              style={{
+                background: "rgba(15, 23, 42, 0.65)",
+                border: "1px solid var(--border-strong)",
+                borderRadius: 14,
+                padding: 18,
+                marginBottom: 18,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: 10,
+                  marginBottom: 12,
+                }}
+              >
+                <div>
+                  <strong style={{ fontSize: 15 }}>
+                    💡 올해 미실현 해외주식 양도세 & 손익통산(Tax-Loss Harvesting) 절세 시뮬레이션
+                  </strong>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      color: "var(--muted)",
+                      marginTop: 2,
+                    }}
+                  >
+                    현재 보유 중인 해외주식(USD)을 올해 안에 전량 매도한다고 가정할 때의 예상 세액과 손실 상계 가능 종목입니다.
+                  </div>
+                </div>
+                <span className="acc-tag">
+                  올해 남은 비과세 공제 한도:{" "}
+                  {fmtKrw(unrealizedSim.remainingFreeGainKrw)}
+                </span>
+              </div>
+
+              <div className="mini-summary-row" style={{ marginBottom: 12 }}>
+                <div className="mini-box">
+                  <div className="label">올해 기실현 해외손익</div>
+                  <div
+                    className={
+                      "val " + pnlClass(unrealizedSim.currentYearRealizedUsdKrw)
+                    }
+                  >
+                    {fmtKrw(unrealizedSim.currentYearRealizedUsdKrw, true)}
+                  </div>
+                </div>
+                <div className="mini-box">
+                  <div className="label">보유 해외주식 미실현 평가익(+)</div>
+                  <div className="val text-up">
+                    {fmtKrw(unrealizedSim.unrealizedGainKrw, true)}
+                  </div>
+                </div>
+                <div className="mini-box">
+                  <div className="label">보유 해외주식 미실현 평가손(-)</div>
+                  <div className="val text-down">
+                    {fmtKrw(unrealizedSim.unrealizedLossKrw, true)}
+                  </div>
+                </div>
+                <div className="mini-box">
+                  <div className="label">
+                    현재 전량 매도 시 예상 양도세 (22%)
+                  </div>
+                  <div className="val">
+                    {fmtKrw(unrealizedSim.estTaxIfSellAllKrw)}{" "}
+                    <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                      (과표 {fmtCompactKrw(unrealizedSim.taxableIfSellAllKrw)})
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {unrealizedSim.lossHarvestCandidates.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    flexWrap: "wrap",
+                    fontSize: 12.5,
+                  }}
+                >
+                  <span style={{ color: "var(--muted)", fontWeight: 700 }}>
+                    ✂️ 손익통산(손실 확정 매도) 후보 종목:
+                  </span>
+                  {unrealizedSim.lossHarvestCandidates.map((c) => (
+                    <span
+                      key={`${c.accountLabel}-${c.symbol}`}
+                      className="badge-down"
+                    >
+                      [{c.accountLabel}] {c.name} ({fmtKrw(c.totalPnlKrw)} · 최대{" "}
+                      {fmtKrw(c.potentialTaxSavingKrw)} 절세)
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Yearly Tax Summary Table */}
+            <div style={{ marginBottom: 18 }}>
+              <h3 className="panel-title" style={{ marginBottom: 10 }}>
+                📅 연도별 해외·국내 실현손익 및 양도세 요약표
+              </h3>
+              <div className="table-wrap">
+                <table className="stock-table">
+                  <thead>
+                    <tr>
+                      <th>귀속연도</th>
+                      <th className="num">해외 매도건수</th>
+                      <th className="num">해외 실현주가손익</th>
+                      <th className="num">해외 실현환차손익</th>
+                      <th className="num">해외 제비용</th>
+                      <th className="num">해외 순실현손익</th>
+                      <th className="num">과세표준(공제후)</th>
+                      <th className="num">예상 양도세(22%)</th>
+                      <th className="num">국내 순실현손익(비과세)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {yearlyTaxSummaries.map((s) => (
+                      <tr key={s.year}>
+                        <td>
+                          <strong>{s.year}년</strong>
+                        </td>
+                        <td className="num">{s.usdSellCount}건</td>
+                        <td className={"num " + pnlClass(s.usdStockPnlKrw)}>
+                          {fmtKrw(s.usdStockPnlKrw, true)}
+                        </td>
+                        <td className={"num " + pnlClass(s.usdFxPnlKrw)}>
+                          {fmtKrw(s.usdFxPnlKrw, true)}
+                        </td>
+                        <td className="num">-{fmtKrw(s.usdFeeKrw)}</td>
+                        <td className={"num " + pnlClass(s.usdNetPnlKrw)}>
+                          <strong>{fmtKrw(s.usdNetPnlKrw, true)}</strong>
+                        </td>
+                        <td className="num">{fmtKrw(s.taxableBaseKrw)}</td>
+                        <td className="num">
+                          <span
+                            className={
+                              s.estimatedTaxKrw > 0 ? "badge-up" : "badge-flat"
+                            }
+                          >
+                            {fmtKrw(s.estimatedTaxKrw)}
+                          </span>
+                        </td>
+                        <td className={"num " + pnlClass(s.krwNetPnlKrw)}>
+                          {fmtKrw(s.krwNetPnlKrw, true)} ({s.krwSellCount}건)
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Individual Realized Trade Details */}
+            <div className="panel-head">
+              <h3 className="panel-title">
+                📋 매도(실현) 건별 주가손익 · 환차손익 명세 ({filteredRealizedTrades.length}건)
+              </h3>
               <div className="filter-bar">
                 <div className="seg-group">
                   {(
                     [
                       { k: "ALL", l: "전체 시장" },
-                      { k: "USD", l: "🇺🇸 해외 (USD)" },
-                      { k: "KRW", l: "🇰🇷 국내 (KRW)" },
+                      { k: "USD", l: "🇺🇸 해외 (양도세 대상)" },
+                      { k: "KRW", l: "🇰🇷 국내 (비과세)" },
                     ] as const
                   ).map((m) => (
                     <button
                       key={m.k}
                       className={
                         "seg-btn" +
-                        (holdingMarketFilter === m.k ? " active" : "")
+                        (taxMarketFilter === m.k ? " active" : "")
                       }
-                      onClick={() => setHoldingMarketFilter(m.k)}
+                      onClick={() => setTaxMarketFilter(m.k)}
                     >
                       {m.l}
                     </button>
                   ))}
                 </div>
-
                 <input
                   className="text-input"
-                  placeholder="🔍 종목명 또는 티커 검색..."
-                  value={holdingSearch}
-                  onChange={(e) => setHoldingSearch(e.target.value)}
+                  placeholder="🔍 종목명/코드 검색..."
+                  value={taxSearch}
+                  onChange={(e) => setTaxSearch(e.target.value)}
                 />
-              </div>
-
-              <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                총 <strong>{filteredHoldings.length}</strong>개 종목 · 평가금액 합계{" "}
-                <strong>
-                  {fmtKrw(
-                    filteredHoldings.reduce((s, h) => s + h.evalKrw, 0)
-                  )}
-                </strong>
               </div>
             </div>
 
@@ -995,83 +2031,99 @@ export default function App() {
               <table className="stock-table">
                 <thead>
                   <tr>
-                    <th>시장</th>
+                    <th>체결일</th>
                     <th>계좌</th>
+                    <th>시장</th>
                     <th>종목명 (코드)</th>
-                    <th className="num">보유수량</th>
-                    <th className="num">평단가</th>
-                    <th className="num">현재가</th>
-                    <th className="num">평가금액(원)</th>
-                    <th className="num">매수원금(원)</th>
-                    <th className="num">총평가손익(원)</th>
-                    <th className="num">환차손익(원)</th>
-                    <th className="num">수익률(%)</th>
-                    <th className="num">비중(%)</th>
+                    <th className="num">매도수량</th>
+                    <th className="num">매도단가</th>
+                    <th className="num">취득평단가</th>
+                    <th className="num">매도/매수환율</th>
+                    <th className="num">매도금액(원)</th>
+                    <th className="num">취득원가(원)</th>
+                    <th className="num">실현주가손익</th>
+                    <th className="num">실현환차손익</th>
+                    <th className="num">제비용(원)</th>
+                    <th className="num">순실현손익(원)</th>
+                    <th className="num">실현수익률</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredHoldings.length === 0 ? (
+                  {filteredRealizedTrades.length === 0 ? (
                     <tr>
                       <td
-                        colSpan={12}
+                        colSpan={15}
                         style={{
                           textAlign: "center",
                           padding: 36,
                           color: "var(--muted)",
                         }}
                       >
-                        표시할 보유종목 데이터가 없습니다.
+                        선택한 조건의 매도(실현) 내역이 없습니다.
                       </td>
                     </tr>
                   ) : (
-                    filteredHoldings.map((h) => (
-                      <tr key={h.key}>
+                    filteredRealizedTrades.map((t) => (
+                      <tr key={`${t.accountLabel}-${t.orderId}`}>
+                        <td>{t.date}</td>
+                        <td>
+                          <span className="acc-tag">{t.accountLabel}</span>
+                        </td>
                         <td>
                           <span
                             className={
                               "market-tag " +
-                              (h.currency.toUpperCase() === "USD"
-                                ? "usd"
-                                : "krw")
+                              (t.currency === "USD" ? "usd" : "krw")
                             }
                           >
-                            {h.currency.toUpperCase() === "USD"
-                              ? "해외 USD"
-                              : "국내 KRW"}
+                            {t.currency === "USD" ? "해외 USD" : "국내 KRW"}
                           </span>
                         </td>
                         <td>
-                          <span className="acc-tag">{h.accountLabel}</span>
-                        </td>
-                        <td>
-                          <strong>{h.name}</strong>{" "}
-                          <span style={{ color: "var(--muted)", fontSize: 11.5 }}>
-                            ({h.symbol})
+                          <strong>{t.name}</strong>{" "}
+                          <span
+                            style={{ color: "var(--muted)", fontSize: 11.5 }}
+                          >
+                            ({t.symbol})
                           </span>
                         </td>
-                        <td className="num">{fmtNum(h.quantity, 4)}</td>
+                        <td className="num">{fmtNum(t.qty, 4)}</td>
                         <td className="num">
-                          {fmtPrice(h.avgPrice, h.currency)}
-                        </td>
-                        <td className="num">
-                          {fmtPrice(h.lastPrice, h.currency)}
+                          {fmtPrice(t.sellPriceNative, t.currency)}
                         </td>
                         <td className="num">
-                          <strong>{fmtKrw(h.evalKrw)}</strong>
+                          {fmtPrice(t.avgBuyPriceNative, t.currency)}
                         </td>
-                        <td className="num">{fmtKrw(h.purchaseKrw)}</td>
-                        <td className={"num " + pnlClass(h.profitKrw)}>
-                          <strong>{fmtKrw(h.profitKrw, true)}</strong>
+                        <td
+                          className="num"
+                          style={{ color: "var(--muted)", fontSize: 12 }}
+                        >
+                          {t.currency === "USD"
+                            ? `${fmtNum(t.sellFx, 1)} / ${fmtNum(
+                                t.avgBuyFx,
+                                1
+                              )}`
+                            : "—"}
                         </td>
-                        <td className={"num " + pnlClass(h.fxPnlKrw)}>
-                          {h.fxPnlKrw ? fmtKrw(h.fxPnlKrw, true) : "—"}
+                        <td className="num">{fmtKrw(t.proceedsKrw)}</td>
+                        <td className="num">{fmtKrw(t.costKrw)}</td>
+                        <td className={"num " + pnlClass(t.stockPnlKrw)}>
+                          {fmtKrw(t.stockPnlKrw, true)}
+                        </td>
+                        <td className={"num " + pnlClass(t.fxPnlKrw)}>
+                          {t.currency === "USD"
+                            ? fmtKrw(t.fxPnlKrw, true)
+                            : "—"}
+                        </td>
+                        <td className="num">-{fmtKrw(t.feeKrw)}</td>
+                        <td className={"num " + pnlClass(t.netPnlKrw)}>
+                          <strong>{fmtKrw(t.netPnlKrw, true)}</strong>
                         </td>
                         <td className="num">
-                          <span className={pnlBadgeClass(h.profitRate)}>
-                            {pnlArrow(h.profitRate)} {fmtPct(h.profitRate)}
+                          <span className={pnlBadgeClass(t.pnlRate)}>
+                            {pnlArrow(t.pnlRate)} {fmtPct(t.pnlRate)}
                           </span>
                         </td>
-                        <td className="num">{h.weightPct.toFixed(1)}%</td>
                       </tr>
                     ))
                   )}
@@ -1082,318 +2134,7 @@ export default function App() {
         </>
       )}
 
-      {/* TAB 2: Daily / Monthly Asset Trend */}
-      {activeTab === "trend" && (
-        <div className="panel">
-          <div className="panel-head">
-            <div>
-              <h2 className="panel-title">📅 일별 · 월별 자산 추이</h2>
-              <div className="panel-sub">
-                월말 기준 요약 또는 일별 전체 스냅샷으로 총자산·매수원금·평가손익 흐름을 비교합니다.
-              </div>
-            </div>
-
-            <div className="filter-bar">
-              <div className="seg-group">
-                <button
-                  className={
-                    "seg-btn" +
-                    (trendGranularity === "monthly" ? " active" : "")
-                  }
-                  onClick={() => setTrendGranularity("monthly")}
-                >
-                  📆 월말 요약 (추천)
-                </button>
-                <button
-                  className={
-                    "seg-btn" + (trendGranularity === "daily" ? " active" : "")
-                  }
-                  onClick={() => setTrendGranularity("daily")}
-                >
-                  📅 일별 전체 보기
-                </button>
-              </div>
-
-              <div className="seg-group">
-                {(
-                  [
-                    { k: "1M", l: "1개월" },
-                    { k: "3M", l: "3개월" },
-                    { k: "6M", l: "6개월" },
-                    { k: "1Y", l: "1년" },
-                    { k: "ALL", l: "전체" },
-                  ] as const
-                ).map((r) => (
-                  <button
-                    key={r.k}
-                    className={
-                      "seg-btn" + (trendRange === r.k ? " active" : "")
-                    }
-                    onClick={() => setTrendRange(r.k)}
-                  >
-                    {r.l}
-                  </button>
-                ))}
-              </div>
-
-              <select
-                className="select-input"
-                value={trendYear}
-                onChange={(e) => setTrendYear(e.target.value)}
-              >
-                <option value="ALL">전체 연도</option>
-                {availableYears.map((y) => (
-                  <option key={y} value={y}>
-                    {y}년
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          {/* Main Area Chart: Total Assets vs Cost */}
-          <div
-            style={{
-              height: 320,
-              background: "rgba(15, 23, 42, 0.55)",
-              border: "1px solid var(--border)",
-              borderRadius: 14,
-              padding: 16,
-              marginBottom: 18,
-            }}
-          >
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart
-                data={filteredTrendSeries}
-                margin={{ top: 10, right: 20, left: 10, bottom: 0 }}
-              >
-                <defs>
-                  <linearGradient id="gradTotal" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.45} />
-                    <stop offset="95%" stopColor="#3b82f6" stopOpacity={0.02} />
-                  </linearGradient>
-                  <linearGradient id="gradStock" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke="rgba(148,163,184,0.12)"
-                />
-                <XAxis dataKey="label" stroke="#94a3b8" fontSize={12} />
-                <YAxis
-                  tickFormatter={(v) => fmtCompactKrw(v)}
-                  stroke="#94a3b8"
-                  fontSize={11.5}
-                  width={80}
-                />
-                <Tooltip
-                  formatter={(val: number, name: string) => [
-                    fmtKrw(val),
-                    name,
-                  ]}
-                  contentStyle={{
-                    background: "#0f172a",
-                    border: "1px solid rgba(148,163,184,0.3)",
-                    borderRadius: 10,
-                    color: "#f1f5f9",
-                  }}
-                />
-                <Legend />
-                <Area
-                  type="monotone"
-                  dataKey="totalAssets"
-                  name="총자산(주식+예수금)"
-                  stroke="#3b82f6"
-                  strokeWidth={2.5}
-                  fill="url(#gradTotal)"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="holdingsEval"
-                  name="주식평가액"
-                  stroke="#8b5cf6"
-                  strokeWidth={2}
-                  fill="url(#gradStock)"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="holdingsCost"
-                  name="매수원금"
-                  stroke="#94a3b8"
-                  strokeDasharray="4 4"
-                  strokeWidth={1.8}
-                  fill="none"
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-
-          {/* Two Color Bar Charts: Profit Trend & Delta Trend */}
-          <div className="grid-2">
-            <div
-              style={{
-                height: 250,
-                background: "rgba(15, 23, 42, 0.55)",
-                border: "1px solid var(--border)",
-                borderRadius: 14,
-                padding: 16,
-              }}
-            >
-              <strong
-                style={{ display: "block", fontSize: 13.5, marginBottom: 8 }}
-              >
-                🎯 평가손익 추이 (🔴 수익 / 🔵 손실)
-              </strong>
-              <ResponsiveContainer width="100%" height="88%">
-                <BarChart data={filteredTrendSeries}>
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="rgba(148,163,184,0.12)"
-                  />
-                  <XAxis dataKey="label" stroke="#94a3b8" fontSize={11} />
-                  <YAxis
-                    tickFormatter={(v) => fmtCompactKrw(v)}
-                    stroke="#94a3b8"
-                    fontSize={11}
-                    width={72}
-                  />
-                  <ReferenceLine y={0} stroke="rgba(148,163,184,0.4)" />
-                  <Tooltip
-                    formatter={(val: number) => [
-                      fmtKrw(val, true),
-                      "평가손익",
-                    ]}
-                    contentStyle={{
-                      background: "#0f172a",
-                      border: "1px solid rgba(148,163,184,0.3)",
-                      borderRadius: 10,
-                    }}
-                  />
-                  <Bar dataKey="profitAmount">
-                    {filteredTrendSeries.map((pt, i) => (
-                      <Cell
-                        key={i}
-                        fill={pt.profitAmount >= 0 ? "#ff6b6b" : "#60a5fa"}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-
-            <div
-              style={{
-                height: 250,
-                background: "rgba(15, 23, 42, 0.55)",
-                border: "1px solid var(--border)",
-                borderRadius: 14,
-                padding: 16,
-              }}
-            >
-              <strong
-                style={{ display: "block", fontSize: 13.5, marginBottom: 8 }}
-              >
-                📊{" "}
-                {trendGranularity === "monthly"
-                  ? "전월 대비 총자산 증감"
-                  : "전일 대비 총자산 증감"}{" "}
-                (🔴 증가 / 🔵 감소)
-              </strong>
-              <ResponsiveContainer width="100%" height="88%">
-                <BarChart data={filteredTrendSeries}>
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="rgba(148,163,184,0.12)"
-                  />
-                  <XAxis dataKey="label" stroke="#94a3b8" fontSize={11} />
-                  <YAxis
-                    tickFormatter={(v) => fmtCompactKrw(v)}
-                    stroke="#94a3b8"
-                    fontSize={11}
-                    width={72}
-                  />
-                  <ReferenceLine y={0} stroke="rgba(148,163,184,0.4)" />
-                  <Tooltip
-                    formatter={(val: number) => [
-                      fmtKrw(val, true),
-                      "자산 증감",
-                    ]}
-                    contentStyle={{
-                      background: "#0f172a",
-                      border: "1px solid rgba(148,163,184,0.3)",
-                      borderRadius: 10,
-                    }}
-                  />
-                  <Bar dataKey="deltaAssets">
-                    {filteredTrendSeries.map((pt, i) => (
-                      <Cell
-                        key={i}
-                        fill={pt.deltaAssets >= 0 ? "#ff6b6b" : "#60a5fa"}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-
-          {/* Trend Table */}
-          <div className="table-wrap">
-            <table className="stock-table">
-              <thead>
-                <tr>
-                  <th>기준일자</th>
-                  <th className="num">총자산(원)</th>
-                  <th className="num">
-                    {trendGranularity === "monthly"
-                      ? "전월 대비(원)"
-                      : "전일 대비(원)"}
-                  </th>
-                  <th className="num">주식평가액(원)</th>
-                  <th className="num">매수원금(원)</th>
-                  <th className="num">예수금(원)</th>
-                  <th className="num">평가손익(원)</th>
-                  <th className="num">수익률(%)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...filteredTrendSeries].reverse().map((pt) => (
-                  <tr key={pt.date}>
-                    <td>
-                      <strong>{pt.date}</strong>
-                    </td>
-                    <td className="num">
-                      <strong>{fmtKrw(pt.totalAssets)}</strong>
-                    </td>
-                    <td className={"num " + pnlClass(pt.deltaAssets)}>
-                      {pt.deltaAssets !== 0
-                        ? `${fmtKrw(pt.deltaAssets, true)} (${fmtPct(
-                            pt.deltaRate
-                          )})`
-                        : "—"}
-                    </td>
-                    <td className="num">{fmtKrw(pt.holdingsEval)}</td>
-                    <td className="num">{fmtKrw(pt.holdingsCost)}</td>
-                    <td className="num">{fmtKrw(pt.cash)}</td>
-                    <td className={"num " + pnlClass(pt.profitAmount)}>
-                      <strong>{fmtKrw(pt.profitAmount, true)}</strong>
-                    </td>
-                    <td className="num">
-                      <span className={pnlBadgeClass(pt.profitRate)}>
-                        {pnlArrow(pt.profitRate)} {fmtPct(pt.profitRate)}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 3: Orders History */}
+      {/* TAB 4: Orders History */}
       {activeTab === "orders" && (
         <div className="panel">
           <div className="panel-head">
@@ -1571,7 +2312,7 @@ export default function App() {
         </div>
       )}
 
-      {/* TAB 4: Dividends */}
+      {/* TAB 5: Dividends */}
       {activeTab === "dividends" && (
         <div className="panel">
           <div className="panel-head">
@@ -1896,12 +2637,14 @@ export default function App() {
         </div>
       )}
 
-      {/* TAB 5: CashFlows & Pure Investment Return */}
+      {/* TAB 6: CashFlows & Pure Investment Return */}
       {activeTab === "cashflow" && (
         <div className="panel">
           <div className="panel-head">
             <div>
-              <h2 className="panel-title">🏧 입출금 내역 & 순입금 대비 실질 수익</h2>
+              <h2 className="panel-title">
+                🏧 입출금 내역 & 순입금 대비 실질 수익
+              </h2>
               <div className="panel-sub">
                 계좌에 실제로 입금한 순원금 대비 현재 총자산의 실질 투자 성과를 계산합니다.
               </div>

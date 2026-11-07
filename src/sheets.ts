@@ -1,15 +1,15 @@
 // Google Sheets v4 reader & writer for TossStock backup spreadsheet
 // Default Spreadsheet ID: 14G8JY2nvRpXHlvuT4-EfZeaTEZLsHaqcgzAFIQcO19A
-// Reads all 10 tabs in a single values:batchGet API call:
-//   [혜신] 일별자산, [혜신] 보유종목, [혜신] 매매이력, [혜신] 입출금, [혜신] 배당
-//   [동헌] 일별자산, [동헌] 보유종목, [동헌] 매매이력, [동헌] 입출금, [동헌] 배당
+// Reads all 14 tabs in a single values:batchGet API call:
+//   [혜신] 일별자산, [혜신] 보유종목, [혜신] 매매이력, [혜신] 실현손익, [혜신] 기간별성과, [혜신] 입출금, [혜신] 배당
+//   [동헌] 일별자산, [동헌] 보유종목, [동헌] 매매이력, [동헌] 실현손익, [동헌] 기간별성과, [동헌] 입출금, [동헌] 배당
 
 import { getAccessToken } from "./auth";
 
 export const DEFAULT_SPREADSHEET_ID =
   "14G8JY2nvRpXHlvuT4-EfZeaTEZLsHaqcgzAFIQcO19A";
 const SPREADSHEET_ID_KEY = "tossStockSpreadsheetId";
-const CACHE_KEY = "tossStockSheetCache_v1";
+const CACHE_KEY = "tossStockSheetCache_v2";
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 
 export type AccountKey = "ALL" | "혜신" | "동헌";
@@ -65,10 +65,13 @@ export interface HoldingSnapshotRow {
   quantity: number;
   avgPrice: number;
   lastPrice: number;
+  avgBuyFx: number;
   evalKrw: number;
   purchaseKrw: number;
-  profitKrw: number;
+  stockPnlKrw: number;
   fxPnlKrw: number;
+  profitKrw: number;
+  profitRateNative: number;
   profitRate: number;
   weightPct: number;
   recordedAt: string;
@@ -97,6 +100,48 @@ export interface OrderHistoryRow {
   orderQuantity: number;
   orderPrice: number;
   orderId: string;
+  recordedAt: string;
+}
+
+export interface RealizedTradeRow {
+  orderId: string;
+  date: string;
+  year: number;
+  accountNumber: string;
+  accountLabel: "혜신" | "동헌";
+  accountAlias: string;
+  symbol: string;
+  name: string;
+  currency: "KRW" | "USD" | string;
+  qty: number;
+  sellPriceNative: number;
+  avgBuyPriceNative: number;
+  sellFx: number;
+  avgBuyFx: number;
+  proceedsKrw: number;
+  costKrw: number;
+  stockPnlKrw: number;
+  fxPnlKrw: number;
+  feeKrw: number;
+  netPnlKrw: number;
+  pnlRate: number;
+  recordedAt: string;
+}
+
+export interface PeriodPerformanceRow {
+  period: string;
+  accountNumber: string;
+  accountLabel: "혜신" | "동헌";
+  accountAlias: string;
+  startDate: string;
+  endDate: string;
+  startAssets: number;
+  endAssets: number;
+  netCashFlow: number;
+  simpleChange: number;
+  simpleRate: number;
+  pureProfit: number;
+  dietzRate: number;
   recordedAt: string;
 }
 
@@ -131,6 +176,8 @@ export interface TossSheetData {
   assetSnapshots: AssetSnapshotRow[];
   holdingsSnapshots: HoldingSnapshotRow[];
   ordersHistory: OrderHistoryRow[];
+  realizedTrades: RealizedTradeRow[];
+  periodPerformance: PeriodPerformanceRow[];
   cashFlows: CashFlowRow[];
   dividends: DividendRow[];
   fetchedAt: string;
@@ -157,7 +204,12 @@ export function loadCachedSheetData(): TossSheetData | null {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
-    return JSON.parse(raw) as TossSheetData;
+    const parsed = JSON.parse(raw) as TossSheetData;
+    return {
+      ...parsed,
+      realizedTrades: parsed.realizedTrades ?? [],
+      periodPerformance: parsed.periodPerformance ?? [],
+    };
   } catch {
     return null;
   }
@@ -172,7 +224,15 @@ export function saveCachedSheetData(data: TossSheetData): void {
 }
 
 const ACCOUNT_LABELS: ("혜신" | "동헌")[] = ["혜신", "동헌"];
-const CATEGORIES = ["일별자산", "보유종목", "매매이력", "입출금", "배당"] as const;
+const CATEGORIES = [
+  "일별자산",
+  "보유종목",
+  "매매이력",
+  "실현손익",
+  "기간별성과",
+  "입출금",
+  "배당",
+] as const;
 
 function resolveAccountLabel(
   rawAccountNo: string,
@@ -241,7 +301,7 @@ async function sheetErrorMessage(res: Response): Promise<string> {
   }
   const prefix =
     res.status === 401
-      ? "구글 로그인 세션이 만료되었습니다. [구글 계정 연결] 버튼을 다시 눌러주세요."
+      ? "구글 로그인 세션이 만료되었습니다. [구글 시트 연결] 버튼을 다시 눌러주세요."
       : res.status === 403 || res.status === 404
       ? "백업 시트에 접근할 수 없습니다. 공유 권한을 확인하세요."
       : "구글 시트를 불러오지 못했습니다.";
@@ -257,7 +317,6 @@ async function batchGetTabs(
   for (const name of tabNames) {
     params.append("ranges", `'${name}'!A1:Z50000`);
   }
-  // FORMATTED_VALUE preserves leading zeros in stock symbols ("005930") and string IDs
   params.set("valueRenderOption", "FORMATTED_VALUE");
   const res = await fetch(
     `${SHEETS_API}/${spreadsheetId}/values:batchGet?${params.toString()}`,
@@ -288,7 +347,6 @@ export async function fetchTossSheetData(
     );
   }
 
-  // First check available sheet tab names so we never fail if a tab doesn't exist yet
   const metaRes = await fetch(
     `${SHEETS_API}/${spreadsheetId}?fields=sheets.properties.title`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -330,6 +388,8 @@ export async function fetchTossSheetData(
   const assetSnapshotsMap = new Map<string, AssetSnapshotRow>();
   const holdingsSnapshotsMap = new Map<string, HoldingSnapshotRow>();
   const ordersHistoryMap = new Map<string, OrderHistoryRow>();
+  const realizedTradesMap = new Map<string, RealizedTradeRow>();
+  const periodPerfMap = new Map<string, PeriodPerformanceRow>();
   const cashFlowsMap = new Map<string, CashFlowRow>();
   const dividendsMap = new Map<string, DividendRow>();
 
@@ -416,9 +476,27 @@ export async function fetchTossSheetData(
           evalKrw - purchaseKrw
         );
         const fxPnlKrw = cleanNum(r["환차손익(원)"] ?? r["fx_pnl_krw"], 0);
+        const stockPnlKrw = cleanNum(
+          r["주가손익(원)"] ?? r["stock_pnl_krw"],
+          profitKrw - fxPnlKrw
+        );
+        const inferredBuyFx =
+          currency === "USD" && quantity * avgPrice > 0
+            ? purchaseKrw / (quantity * avgPrice)
+            : 1;
+        const avgBuyFx = cleanNum(
+          r["매수평균환율(원/$)"] ?? r["avg_buy_fx"],
+          inferredBuyFx
+        );
         const profitRate = cleanNum(
           r["수익률(%)"] ?? r["profit_rate"],
           purchaseKrw > 0 ? (profitKrw / purchaseKrw) * 100 : 0
+        );
+        const inferredNativeRate =
+          avgPrice > 0 ? ((lastPrice - avgPrice) / avgPrice) * 100 : profitRate;
+        const profitRateNative = cleanNum(
+          r["수익률(통화%)"] ?? r["profit_rate_native"],
+          inferredNativeRate
         );
         const weightPct = cleanNum(r["비중(%)"] ?? r["weight_pct"], 0);
         const recordedAt = r["기록시각"] || r["recorded_at"] || "";
@@ -434,10 +512,13 @@ export async function fetchTossSheetData(
           quantity,
           avgPrice,
           lastPrice,
+          avgBuyFx,
           evalKrw,
           purchaseKrw,
-          profitKrw,
+          stockPnlKrw,
           fxPnlKrw,
+          profitKrw,
+          profitRateNative,
           profitRate,
           weightPct,
           recordedAt,
@@ -515,6 +596,132 @@ export async function fetchTossSheetData(
           orderQuantity,
           orderPrice,
           orderId,
+          recordedAt,
+        });
+      }
+    } else if (category === "실현손익") {
+      for (let idx = 0; idx < rows.length; idx++) {
+        const r = rows[idx];
+        const date = normalizeDate(r["체결일"] || r["date"]);
+        if (!date) continue;
+        const accountNumber =
+          r["계좌번호"] || r["account_number"] || defaultAccNo;
+        const accountAlias =
+          r["계좌명"] || r["account_alias"] || defaultAlias;
+        const accountLabel = resolveAccountLabel(
+          accountNumber,
+          accountAlias,
+          label
+        );
+        const symbol = (r["종목코드"] || r["symbol"] || "").replace(/^'/, "");
+        const name = r["종목명"] || r["name"] || symbol;
+        const currency = (r["통화"] || r["currency"] || "KRW").toUpperCase();
+        const year =
+          cleanNum(r["과세연도"] ?? r["year"]) || Number(date.slice(0, 4));
+        const qty = cleanNum(r["매도수량"] ?? r["qty"]);
+        const sellPriceNative = cleanNum(
+          r["매도단가"] ?? r["sell_price_native"]
+        );
+        const avgBuyPriceNative = cleanNum(
+          r["취득평단가"] ?? r["avg_buy_price_native"]
+        );
+        const sellFx = cleanNum(r["매도환율(원/$)"] ?? r["sell_fx"], 1);
+        const avgBuyFx = cleanNum(r["매수평균환율(원/$)"] ?? r["avg_buy_fx"], 1);
+        const proceedsKrw = cleanNum(r["매도금액(원)"] ?? r["proceeds_krw"]);
+        const costKrw = cleanNum(r["취득원가(원)"] ?? r["cost_krw"]);
+        const stockPnlKrw = cleanNum(r["주가손익(원)"] ?? r["stock_pnl_krw"]);
+        const fxPnlKrw = cleanNum(r["환차손익(원)"] ?? r["fx_pnl_krw"]);
+        const feeKrw = cleanNum(r["수수료·제세금(원)"] ?? r["fee_krw"]);
+        const netPnlKrw = cleanNum(
+          r["순실현손익(원)"] ?? r["net_pnl_krw"],
+          proceedsKrw - costKrw - feeKrw
+        );
+        const pnlRate = cleanNum(
+          r["실현수익률(%)"] ?? r["pnl_rate"],
+          costKrw > 0 ? (netPnlKrw / costKrw) * 100 : 0
+        );
+        const orderId =
+          (r["주문ID"] || r["order_id"] || "").replace(/^'/, "") ||
+          `real-${accountLabel}-${date}-${symbol}-${idx}`;
+        const recordedAt = r["기록시각"] || r["recorded_at"] || "";
+
+        realizedTradesMap.set(`${accountLabel}__${orderId}`, {
+          orderId,
+          date,
+          year,
+          accountNumber,
+          accountLabel,
+          accountAlias,
+          symbol,
+          name,
+          currency,
+          qty,
+          sellPriceNative,
+          avgBuyPriceNative,
+          sellFx,
+          avgBuyFx,
+          proceedsKrw,
+          costKrw,
+          stockPnlKrw,
+          fxPnlKrw,
+          feeKrw,
+          netPnlKrw,
+          pnlRate,
+          recordedAt,
+        });
+      }
+    } else if (category === "기간별성과") {
+      for (const r of rows) {
+        const period = r["기간"] || r["period"] || "";
+        if (!period) continue;
+        const accountNumber =
+          r["계좌번호"] || r["account_number"] || defaultAccNo;
+        const accountAlias =
+          r["계좌명"] || r["account_alias"] || defaultAlias;
+        const accountLabel = resolveAccountLabel(
+          accountNumber,
+          accountAlias,
+          label
+        );
+        const startDate = normalizeDate(r["시작일"] || r["start_date"]);
+        const endDate = normalizeDate(r["종료일"] || r["end_date"]);
+        const startAssets = cleanNum(r["기초자산(원)"] ?? r["start_assets"]);
+        const endAssets = cleanNum(r["기말자산(원)"] ?? r["end_assets"]);
+        const netCashFlow = cleanNum(
+          r["기간순입출금(원)"] ?? r["net_cash_flow"]
+        );
+        const simpleChange = cleanNum(
+          r["단순자산증감(원)"] ?? r["simple_change"],
+          endAssets - startAssets
+        );
+        const simpleRate = cleanNum(
+          r["단순증감률(%)"] ?? r["simple_rate"],
+          startAssets > 0 ? (simpleChange / startAssets) * 100 : 0
+        );
+        const pureProfit = cleanNum(
+          r["순수투자손익(원)"] ?? r["pure_profit"],
+          endAssets - startAssets - netCashFlow
+        );
+        const dietzRate = cleanNum(
+          r["실질투자성장률(%)"] ?? r["dietz_rate"],
+          simpleRate
+        );
+        const recordedAt = r["기록시각"] || r["recorded_at"] || "";
+
+        periodPerfMap.set(`${accountLabel}__${period}`, {
+          period,
+          accountNumber,
+          accountLabel,
+          accountAlias,
+          startDate,
+          endDate,
+          startAssets,
+          endAssets,
+          netCashFlow,
+          simpleChange,
+          simpleRate,
+          pureProfit,
+          dietzRate,
           recordedAt,
         });
       }
@@ -604,6 +811,10 @@ export async function fetchTossSheetData(
     (a, b) =>
       b.date.localeCompare(a.date) || b.filledAt.localeCompare(a.filledAt)
   );
+  const realizedTrades = Array.from(realizedTradesMap.values()).sort((a, b) =>
+    b.date.localeCompare(a.date)
+  );
+  const periodPerformance = Array.from(periodPerfMap.values());
   const cashFlows = Array.from(cashFlowsMap.values()).sort((a, b) =>
     b.date.localeCompare(a.date)
   );
@@ -616,6 +827,8 @@ export async function fetchTossSheetData(
     assetSnapshots,
     holdingsSnapshots,
     ordersHistory,
+    realizedTrades,
+    periodPerformance,
     cashFlows,
     dividends,
     fetchedAt: new Date().toISOString(),
@@ -625,7 +838,6 @@ export async function fetchTossSheetData(
   return result;
 }
 
-// Append a new CashFlow row directly to `[혜신] 입출금` or `[동헌] 입출금`
 export async function appendCashFlowToSheet(input: {
   accountLabel: "혜신" | "동헌";
   date: string;
@@ -641,7 +853,6 @@ export async function appendCashFlowToSheet(input: {
   const nowStr = new Date().toISOString().replace("T", " ").slice(0, 19);
   const id = Math.random().toString(36).slice(2, 10);
 
-  // Columns: 날짜 | 계좌번호 | 입출금구분 | 금액(원) | 메모 | 기록시각 | 기록ID
   const row = [
     input.date,
     `'${accNo}`,
@@ -667,7 +878,6 @@ export async function appendCashFlowToSheet(input: {
   if (!res.ok) throw new Error(await sheetErrorMessage(res));
 }
 
-// Append a new Dividend row directly to `[혜신] 배당` or `[동헌] 배당`
 export async function appendDividendToSheet(input: {
   accountLabel: "혜신" | "동헌";
   date: string;
@@ -687,7 +897,6 @@ export async function appendDividendToSheet(input: {
   const nowStr = new Date().toISOString().replace("T", " ").slice(0, 19);
   const id = Math.random().toString(36).slice(2, 10);
 
-  // Columns: 지급일 | 계좌번호 | 종목코드 | 종목명 | 통화 | 세전배당금(통화) | 세금(통화) | 세후배당금(원) | 메모 | 기록시각 | 기록ID
   const row = [
     input.date,
     `'${accNo}`,
