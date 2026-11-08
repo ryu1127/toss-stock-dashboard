@@ -115,14 +115,16 @@ export default function App() {
     }
   }, [holdingDates, selectedHoldingDate]);
 
-  // Trend Tab states
+  // Trend Tab states (Default: 일별 보기 + 최근 3개월 so daily changes are immediately visible & crisp)
   const [trendGranularity, setTrendGranularity] = useState<"monthly" | "daily">(
-    "monthly"
+    "daily"
   );
   const [trendRange, setTrendRange] = useState<
-    "1M" | "3M" | "6M" | "1Y" | "ALL"
-  >("ALL");
+    "1W" | "1M" | "3M" | "6M" | "YTD" | "1Y" | "ALL"
+  >("3M");
   const [trendYear, setTrendYear] = useState<string>("ALL");
+  const [trendMonth, setTrendMonth] = useState<string>("ALL");
+  const [showAllTrendRows, setShowAllTrendRows] = useState<boolean>(false);
 
   // Tax & Realized P&L Tab states
   const [taxYear, setTaxYear] = useState<string>("");
@@ -356,21 +358,44 @@ export default function App() {
     const base =
       trendGranularity === "monthly" ? monthlySeries : dailySeries;
     let list = base;
+    if (trendMonth !== "ALL") {
+      list = list.filter((p) => p.date.startsWith(trendMonth));
+      return list;
+    }
     if (trendYear !== "ALL") {
       list = list.filter((p) => p.date.startsWith(trendYear));
     }
     if (trendRange !== "ALL" && list.length > 0) {
-      const lastDate = new Date(list[list.length - 1].date);
-      const daysMap = { "1M": 31, "3M": 92, "6M": 183, "1Y": 366 };
-      const cutoff = new Date(
-        lastDate.getTime() - daysMap[trendRange] * 86400_000
-      )
-        .toISOString()
-        .slice(0, 10);
-      list = list.filter((p) => p.date >= cutoff);
+      const lastDateStr = list[list.length - 1].date;
+      if (trendRange === "YTD") {
+        const ytdYear = lastDateStr.slice(0, 4);
+        list = list.filter((p) => p.date.startsWith(ytdYear));
+      } else {
+        const lastDate = new Date(lastDateStr);
+        const daysMap = {
+          "1W": 7,
+          "1M": 31,
+          "3M": 92,
+          "6M": 183,
+          "1Y": 366,
+        };
+        const cutoff = new Date(
+          lastDate.getTime() - daysMap[trendRange] * 86400_000
+        )
+          .toISOString()
+          .slice(0, 10);
+        list = list.filter((p) => p.date >= cutoff);
+      }
     }
     return list;
-  }, [dailySeries, monthlySeries, trendGranularity, trendRange, trendYear]);
+  }, [
+    dailySeries,
+    monthlySeries,
+    trendGranularity,
+    trendRange,
+    trendYear,
+    trendMonth,
+  ]);
 
   // Selected Tax Year Summary & Filtered Realized Trades
   const effectiveTaxYear =
@@ -2714,7 +2739,7 @@ export default function App() {
                     🏆 기간별 투자 성과 요약 (Modified Dietz 실질 성장률)
                   </h2>
                   <div className="panel-sub">
-                    최근 1주 · 1개월 · 3개월 · 6개월 · 올해(YTD) · 1년 · 전체 기록 기간 동안 입출금 왜곡을 제거한 순수 투자손익과 실질 성장률입니다.
+                    구간 행을 클릭하면 아래 차트와 표가 해당 기간의 <strong>📅 일별 자산 추이</strong>로 즉시 연동됩니다.
                   </div>
                 </div>
               </div>
@@ -2723,7 +2748,7 @@ export default function App() {
                 <table className="stock-table">
                   <thead>
                     <tr>
-                      <th>구간</th>
+                      <th>구간 (클릭 시 차트 연동)</th>
                       <th>산정 기간</th>
                       <th className="num">기초자산(원)</th>
                       <th className="num">기말자산(원)</th>
@@ -2735,39 +2760,76 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {periodPerformance.map((p) => (
-                      <tr key={p.period}>
-                        <td>
-                          <strong>{p.period}</strong>
-                        </td>
-                        <td style={{ color: "var(--muted)", fontSize: 12 }}>
-                          {p.startDate} ~ {p.endDate}
-                        </td>
-                        <td className="num">{fmtKrw(p.startAssets)}</td>
-                        <td className="num">
-                          <strong>{fmtKrw(p.endAssets)}</strong>
-                        </td>
-                        <td className={"num " + pnlClass(p.netCashFlow)}>
-                          {p.netCashFlow !== 0
-                            ? fmtKrw(p.netCashFlow, true)
-                            : "0원"}
-                        </td>
-                        <td className={"num " + pnlClass(p.simpleChange)}>
-                          {fmtKrw(p.simpleChange, true)}
-                        </td>
-                        <td className={"num " + pnlClass(p.simpleRate)}>
-                          {fmtPct(p.simpleRate)}
-                        </td>
-                        <td className={"num " + pnlClass(p.pureProfit)}>
-                          <strong>{fmtKrw(p.pureProfit, true)}</strong>
-                        </td>
-                        <td className="num">
-                          <span className={pnlBadgeClass(p.dietzRate)}>
-                            {pnlArrow(p.dietzRate)} {fmtPct(p.dietzRate)}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                    {periodPerformance.map((p) => {
+                      const periodKeyMap: Record<
+                        string,
+                        "1W" | "1M" | "3M" | "6M" | "YTD" | "1Y" | "ALL"
+                      > = {
+                        "1주": "1W",
+                        "1개월": "1M",
+                        "3개월": "3M",
+                        "6개월": "6M",
+                        "올해(YTD)": "YTD",
+                        "1년": "1Y",
+                        전체: "ALL",
+                      };
+                      const mappedRange = periodKeyMap[p.period] ?? "3M";
+                      const isRowActive =
+                        trendMonth === "ALL" &&
+                        trendYear === "ALL" &&
+                        trendRange === mappedRange;
+                      return (
+                        <tr
+                          key={p.period}
+                          className="clickable-row"
+                          style={
+                            isRowActive
+                              ? { background: "rgba(59, 130, 246, 0.14)" }
+                              : undefined
+                          }
+                          onClick={() => {
+                            setTrendMonth("ALL");
+                            setTrendYear("ALL");
+                            setTrendRange(mappedRange);
+                            setTrendGranularity("daily");
+                            setShowAllTrendRows(false);
+                          }}
+                        >
+                          <td>
+                            <strong>
+                              {isRowActive ? "📍 " : ""}
+                              {p.period}
+                            </strong>
+                          </td>
+                          <td style={{ color: "var(--muted)", fontSize: 12 }}>
+                            {p.startDate} ~ {p.endDate}
+                          </td>
+                          <td className="num">{fmtKrw(p.startAssets)}</td>
+                          <td className="num">
+                            <strong>{fmtKrw(p.endAssets)}</strong>
+                          </td>
+                          <td className={"num " + pnlClass(p.netCashFlow)}>
+                            {p.netCashFlow !== 0
+                              ? fmtKrw(p.netCashFlow, true)
+                              : "0원"}
+                          </td>
+                          <td className={"num " + pnlClass(p.simpleChange)}>
+                            {fmtKrw(p.simpleChange, true)}
+                          </td>
+                          <td className={"num " + pnlClass(p.simpleRate)}>
+                            {fmtPct(p.simpleRate)}
+                          </td>
+                          <td className={"num " + pnlClass(p.pureProfit)}>
+                            <strong>{fmtKrw(p.pureProfit, true)}</strong>
+                          </td>
+                          <td className="num">
+                            <span className={pnlBadgeClass(p.dietzRate)}>
+                              {pnlArrow(p.dietzRate)} {fmtPct(p.dietzRate)}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -2777,40 +2839,82 @@ export default function App() {
           <div className="panel">
             <div className="panel-head">
               <div>
-                <h2 className="panel-title">📅 일별 · 월별 자산 추이</h2>
+                <h2 className="panel-title">
+                  📅 일별 · 월별 자산 추이{" "}
+                  <span
+                    className="badge-flat"
+                    style={{ marginLeft: 8, fontSize: 12 }}
+                  >
+                    현재{" "}
+                    {trendGranularity === "daily" ? "일별" : "월말 요약"}{" "}
+                    {filteredTrendSeries.length.toLocaleString("ko-KR")}
+                    {trendGranularity === "daily" ? "일" : "개월"} 표시 중 (전체{" "}
+                    {dailySeries.length.toLocaleString("ko-KR")}일 보관)
+                  </span>
+                </h2>
                 <div className="panel-sub">
-                  월말 기준 요약 또는 일별 전체 스냅샷으로 총자산·매수원금·평가손익 흐름을 비교합니다.
+                  {trendGranularity === "daily"
+                    ? "일별 상세 스냅샷 모드입니다. 하단 표에서 날짜를 누르면 해당 일자의 포트폴리오 보유종목(타임머신)으로 이동할 수 있습니다."
+                    : "월말 요약 모드입니다. 하단 표에서 특정 월(YYYY-MM)을 클릭하면 해당 월의 일별 상세 추이로 즉시 전환됩니다."}
                 </div>
               </div>
 
               <div className="filter-bar">
-                <div className="seg-group">
+                {trendMonth !== "ALL" && (
                   <button
-                    className={
-                      "seg-btn" +
-                      (trendGranularity === "monthly" ? " active" : "")
-                    }
-                    onClick={() => setTrendGranularity("monthly")}
+                    className="btn btn-primary"
+                    onClick={() => {
+                      setTrendMonth("ALL");
+                      setShowAllTrendRows(false);
+                    }}
                   >
-                    📆 월말 요약 (추천)
+                    📍 {trendMonth} 일별 상세 보기 중 ✕ 해제
                   </button>
+                )}
+
+                <div className="seg-group">
                   <button
                     className={
                       "seg-btn" +
                       (trendGranularity === "daily" ? " active" : "")
                     }
-                    onClick={() => setTrendGranularity("daily")}
+                    onClick={() => {
+                      setTrendGranularity("daily");
+                      setShowAllTrendRows(false);
+                    }}
                   >
-                    📅 일별 전체 보기
+                    📅 일별 상세 보기 ({dailySeries.length.toLocaleString()}일)
+                  </button>
+                  <button
+                    className={
+                      "seg-btn" +
+                      (trendGranularity === "monthly" ? " active" : "")
+                    }
+                    onClick={() => {
+                      setTrendMonth("ALL");
+                      setTrendGranularity("monthly");
+                      if (
+                        trendRange === "1W" ||
+                        trendRange === "1M" ||
+                        trendRange === "3M"
+                      ) {
+                        setTrendRange("ALL");
+                      }
+                      setShowAllTrendRows(false);
+                    }}
+                  >
+                    📆 월말 요약 ({monthlySeries.length}개월)
                   </button>
                 </div>
 
                 <div className="seg-group">
                   {(
                     [
+                      { k: "1W", l: "1주" },
                       { k: "1M", l: "1개월" },
                       { k: "3M", l: "3개월" },
                       { k: "6M", l: "6개월" },
+                      { k: "YTD", l: "올해" },
                       { k: "1Y", l: "1년" },
                       { k: "ALL", l: "전체" },
                     ] as const
@@ -2818,9 +2922,24 @@ export default function App() {
                     <button
                       key={r.k}
                       className={
-                        "seg-btn" + (trendRange === r.k ? " active" : "")
+                        "seg-btn" +
+                        (trendMonth === "ALL" && trendRange === r.k
+                          ? " active"
+                          : "")
                       }
-                      onClick={() => setTrendRange(r.k)}
+                      onClick={() => {
+                        setTrendMonth("ALL");
+                        setTrendRange(r.k);
+                        if (
+                          r.k === "1W" ||
+                          r.k === "1M" ||
+                          r.k === "3M" ||
+                          r.k === "6M"
+                        ) {
+                          setTrendGranularity("daily");
+                        }
+                        setShowAllTrendRows(false);
+                      }}
                     >
                       {r.l}
                     </button>
@@ -2830,7 +2949,14 @@ export default function App() {
                 <select
                   className="select-input"
                   value={trendYear}
-                  onChange={(e) => setTrendYear(e.target.value)}
+                  onChange={(e) => {
+                    setTrendMonth("ALL");
+                    setTrendYear(e.target.value);
+                    if (e.target.value !== "ALL") {
+                      setTrendRange("ALL");
+                    }
+                    setShowAllTrendRows(false);
+                  }}
                 >
                   <option value="ALL">전체 연도</option>
                   {availableYears.map((y) => (
@@ -2883,7 +3009,12 @@ export default function App() {
                     strokeDasharray="3 3"
                     stroke="rgba(148,163,184,0.12)"
                   />
-                  <XAxis dataKey="label" stroke="#94a3b8" fontSize={12} />
+                  <XAxis
+                    dataKey="label"
+                    stroke="#94a3b8"
+                    fontSize={12}
+                    minTickGap={36}
+                  />
                   <YAxis
                     tickFormatter={(v) => fmtCompactKrw(v)}
                     stroke="#94a3b8"
@@ -2953,7 +3084,12 @@ export default function App() {
                       strokeDasharray="3 3"
                       stroke="rgba(148,163,184,0.12)"
                     />
-                    <XAxis dataKey="label" stroke="#94a3b8" fontSize={11} />
+                    <XAxis
+                      dataKey="label"
+                      stroke="#94a3b8"
+                      fontSize={11}
+                      minTickGap={36}
+                    />
                     <YAxis
                       tickFormatter={(v) => fmtCompactKrw(v)}
                       stroke="#94a3b8"
@@ -2972,7 +3108,7 @@ export default function App() {
                         borderRadius: 10,
                       }}
                     />
-                    <Bar dataKey="profitAmount">
+                    <Bar dataKey="profitAmount" maxBarSize={28}>
                       {filteredTrendSeries.map((pt, i) => (
                         <Cell
                           key={i}
@@ -3008,7 +3144,12 @@ export default function App() {
                       strokeDasharray="3 3"
                       stroke="rgba(148,163,184,0.12)"
                     />
-                    <XAxis dataKey="label" stroke="#94a3b8" fontSize={11} />
+                    <XAxis
+                      dataKey="label"
+                      stroke="#94a3b8"
+                      fontSize={11}
+                      minTickGap={36}
+                    />
                     <YAxis
                       tickFormatter={(v) => fmtCompactKrw(v)}
                       stroke="#94a3b8"
@@ -3027,7 +3168,7 @@ export default function App() {
                         borderRadius: 10,
                       }}
                     />
-                    <Bar dataKey="deltaAssets">
+                    <Bar dataKey="deltaAssets" maxBarSize={28}>
                       {filteredTrendSeries.map((pt, i) => (
                         <Cell
                           key={i}
@@ -3044,7 +3185,11 @@ export default function App() {
               <table className="stock-table">
                 <thead>
                   <tr>
-                    <th>기준일자</th>
+                    <th>
+                      {trendGranularity === "monthly"
+                        ? "기준월 (클릭 시 해당 월 일별 보기)"
+                        : "기준일자 (클릭 시 보유종목 타임머신)"}
+                    </th>
                     <th className="num">총자산(원)</th>
                     <th className="num">
                       {trendGranularity === "monthly"
@@ -3059,10 +3204,37 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {[...filteredTrendSeries].reverse().map((pt) => (
-                    <tr key={pt.date}>
+                  {(showAllTrendRows
+                    ? [...filteredTrendSeries].reverse()
+                    : [...filteredTrendSeries].reverse().slice(0, 120)
+                  ).map((pt) => (
+                    <tr
+                      key={pt.date}
+                      className="clickable-row"
+                      onClick={() => {
+                        if (trendGranularity === "monthly") {
+                          setTrendMonth(pt.date.slice(0, 7));
+                          setTrendGranularity("daily");
+                          setShowAllTrendRows(true);
+                        } else {
+                          setSelectedHoldingDate(pt.date);
+                          jumpToTab("portfolio");
+                        }
+                      }}
+                    >
                       <td>
-                        <strong>{pt.date}</strong>
+                        <strong>{pt.date}</strong>{" "}
+                        <span
+                          style={{
+                            fontSize: 11,
+                            color: "var(--muted)",
+                            marginLeft: 4,
+                          }}
+                        >
+                          {trendGranularity === "monthly"
+                            ? "🔍 일별 펼치기"
+                            : "📊 종목 보기"}
+                        </span>
                       </td>
                       <td className="num">
                         <strong>{fmtKrw(pt.totalAssets)}</strong>
@@ -3089,6 +3261,19 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
+              {!showAllTrendRows && filteredTrendSeries.length > 120 && (
+                <div style={{ textAlign: "center", marginTop: 12 }}>
+                  <button
+                    className="btn"
+                    onClick={() => setShowAllTrendRows(true)}
+                  >
+                    👇 나머지{" "}
+                    {(filteredTrendSeries.length - 120).toLocaleString("ko-KR")}
+                    일치 내역 모두 펼치기 (전체{" "}
+                    {filteredTrendSeries.length.toLocaleString("ko-KR")}행)
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </>
